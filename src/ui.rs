@@ -1,9 +1,10 @@
 use crate::app::{App, AppMode};
+
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 use ratatui_image::{protocol::StatefulProtocol, Resize, StatefulImage};
@@ -38,6 +39,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_progress(frame, app, chunks[3]);
     }
     render_status_bar(frame, app, chunks[4]);
+
+    if app.mode == AppMode::Confirming {
+        render_confirm_dialog(frame, app, area);
+    }
 }
 
 fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -233,11 +238,8 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let info = vec![
         Line::from(Span::styled(
             truncate(&result.title, 38),
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(Color::White),
+            Style::default().add_modifier(Modifier::BOLD).fg(Color::White),
         )),
-        Line::from(""),
         Line::from(vec![
             Span::styled("Channel:  ", Style::default().fg(Color::Cyan)),
             Span::raw(channel),
@@ -251,14 +253,15 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
             Span::raw(views),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            "[Enter] Play now (clear queue)",
-            Style::default().fg(Color::Green),
-        )),
-        Line::from(Span::styled(
-            "[f] Add to queue",
-            Style::default().fg(Color::Yellow),
-        )),
+        Line::from(Span::styled("[Enter] Play now (clear queue)", Style::default().fg(Color::Green))),
+        Line::from(Span::styled("[f]     Add to queue",           Style::default().fg(Color::Yellow))),
+        Line::from(""),
+        Line::from(Span::styled("[Space] Pause / resume",         Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("[h/l]   Seek -/+5s",             Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("[[ ]]   Prev / next track",      Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("[+/-]   Volume",                 Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("[d]     Toggle thumbnails",      Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("[q]     Quit",                   Style::default().fg(Color::DarkGray))),
     ];
 
     let p = Paragraph::new(info).wrap(Wrap { trim: true });
@@ -302,16 +305,28 @@ fn render_progress(frame: &mut Frame, app: &mut App, area: Rect) {
     let duration = app.now_playing.as_ref().and_then(|t| t.duration).unwrap_or(0.0);
     let ratio = if duration > 0.0 { (pos / duration).clamp(0.0, 1.0) } else { 0.0 };
 
-    let label = format!("{} / {}", fmt_duration(pos as u64), fmt_duration(duration as u64));
+    let label = format!(" {} / {} ", fmt_duration(pos as u64), fmt_duration(duration as u64));
+    let label_w = label.chars().count() as u16;
+    let bar_w = area.width.saturating_sub(label_w) as usize;
 
-    let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
-        .ratio(ratio)
-        .label(label)
-        .use_unicode(true);
+    let filled = (ratio * bar_w as f64).round() as usize;
+    let filled = filled.clamp(0, bar_w);
 
-    frame.render_widget(gauge, area);
-    app.progress_bar_area = Some(area);
+    let mut spans = Vec::new();
+    if filled > 1 {
+        spans.push(Span::styled("━".repeat(filled - 1), Style::default().fg(Color::Cyan)));
+    }
+    if filled > 0 {
+        spans.push(Span::styled("╸", Style::default().fg(Color::White)));
+    }
+    if filled < bar_w {
+        spans.push(Span::styled("╌".repeat(bar_w - filled), Style::default().fg(Color::DarkGray)));
+    }
+    spans.push(Span::styled(label, Style::default().fg(Color::White)));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    // Only the bar portion is clickable, not the label.
+    app.progress_bar_area = Some(Rect { width: bar_w as u16, ..area });
 }
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -324,16 +339,16 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             format!("  |  Next: {}", truncate(&app.queue[0].title, 25))
         };
         let t = format!(
-            " {} {}  |  {} elapsed  |  vol {}%{}  |  [Space] pause  [h/l] -/+5s  [[] []] skip  [f] queue  [q] quit",
+            " {} {}  |  {} elapsed  |  vol {}%{}",
             icon,
-            truncate(&track.title, 30),
+            truncate(&track.title, 45),
             pos,
             app.volume,
             queue_info,
         );
         (t, Style::default().fg(Color::Green))
     } else {
-        let t = " No track playing  |  [/] search  [arrows/jk] navigate  [Enter] play  [f] add to queue  [q] quit"
+        let t = " No track playing  |  [/] search  [j/k] navigate  [Enter] play"
             .to_string();
         (t, Style::default().fg(Color::DarkGray))
     };
@@ -342,6 +357,52 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         .block(Block::default().borders(Borders::ALL))
         .style(style);
     frame.render_widget(p, area);
+}
+
+fn render_confirm_dialog(frame: &mut Frame, app: &App, area: Rect) {
+    let title = app.confirm_title.as_deref().unwrap_or("this track");
+    let truncated = truncate(title, 40);
+
+    let popup = centered_rect(54, 7, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Play now? ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let content = vec![
+        Line::from(vec![
+            Span::raw("  Play "),
+            Span::styled(format!("\"{}\"", truncated), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(Span::styled(
+            "  and clear the queue?",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [Y] Yes  ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("(default)", Style::default().fg(Color::DarkGray)),
+            Span::styled("     [n] No", Style::default().fg(Color::Red)),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(content), inner);
+}
+
+fn centered_rect(width_pct: u16, height: u16, area: Rect) -> Rect {
+    let w = (area.width * width_pct / 100).min(area.width);
+    let h = height.min(area.height);
+    Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    }
 }
 
 pub fn fmt_duration(secs: u64) -> String {

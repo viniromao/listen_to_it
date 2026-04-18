@@ -42,6 +42,7 @@ pub enum MediaAction {
 pub enum AppMode {
     Normal,
     Searching,
+    Confirming,
 }
 
 pub struct App {
@@ -74,6 +75,8 @@ pub struct App {
 
     pub show_visuals: bool,
     pub progress_bar_area: Option<Rect>,
+    // Title of the track pending confirmation before playing.
+    pub confirm_title: Option<String>,
 }
 
 impl App {
@@ -109,6 +112,7 @@ impl App {
 
             show_visuals: true,
             progress_bar_area: None,
+            confirm_title: None,
         }
     }
 
@@ -126,6 +130,7 @@ impl App {
                             return Ok(true);
                         }
                     }
+                    AppMode::Confirming => self.handle_confirm_key(key.code).await?,
                 }
             }
             Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column, row, .. }) => {
@@ -182,7 +187,16 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                self.play_selected().await?;
+                // Ask for confirmation only when it would disrupt playback or clear a queue.
+                let needs_confirm = self.now_playing.is_some() || !self.queue.is_empty();
+                if needs_confirm {
+                    if let Some(result) = self.search_results.get(self.selected_index) {
+                        self.confirm_title = Some(result.title.clone());
+                        self.mode = AppMode::Confirming;
+                    }
+                } else {
+                    self.play_selected().await?;
+                }
             }
             KeyCode::Char('f') => {
                 self.queue_selected().await?;
@@ -498,6 +512,24 @@ impl App {
             .map(|s| s.elapsed().as_secs_f64())
             .unwrap_or(0.0);
         self.paused_elapsed + running
+    }
+
+    async fn handle_confirm_key(&mut self, key: KeyCode) -> Result<()> {
+        match key {
+            // Enter or 'y'/'Y' → confirmed, play now.
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.mode = AppMode::Normal;
+                self.confirm_title = None;
+                self.play_selected().await?;
+            }
+            // 'n'/'N' or Esc → cancelled.
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = AppMode::Normal;
+                self.confirm_title = None;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     async fn seek_by(&mut self, delta: f64) -> Result<()> {
