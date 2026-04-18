@@ -15,7 +15,7 @@ enum PlayerCmd {
     Play(String),
     TogglePause,
     SetVolume(i32),
-    Seek(f64),
+    SeekAbs(f64),
     Stop,
     Quit,
 }
@@ -49,8 +49,8 @@ impl Player {
         Ok(())
     }
 
-    pub async fn seek(&self, seconds: f64) -> Result<()> {
-        self.send(PlayerCmd::Seek(seconds));
+    pub async fn seek_abs(&self, seconds: f64) -> Result<()> {
+        self.send(PlayerCmd::SeekAbs(seconds.max(0.0)));
         Ok(())
     }
 
@@ -167,8 +167,8 @@ fn player_thread(rx: mpsc::Receiver<PlayerCmd>, event_tx: UnboundedSender<AppMes
                     let _ = ipc_send(json!({"command": ["set_property", "volume", v]}));
                 }
 
-                PlayerCmd::Seek(secs) => {
-                    let _ = ipc_send(json!({"command": ["seek", secs, "relative"]}));
+                PlayerCmd::SeekAbs(secs) => {
+                    let _ = ipc_send(json!({"command": ["seek", secs, "absolute"]}));
                 }
 
                 PlayerCmd::Stop => {

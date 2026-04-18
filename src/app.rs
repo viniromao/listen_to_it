@@ -1,7 +1,10 @@
 use crate::player::Player;
 use crate::youtube::VideoResult;
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 use image::DynamicImage;
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use souvlaki::{MediaControls, MediaMetadata, MediaPlayback};
@@ -68,6 +71,9 @@ pub struct App {
 
     // Stored on main thread only — not required to be Send.
     pub media_controls: Option<MediaControls>,
+
+    pub show_visuals: bool,
+    pub progress_bar_area: Option<Rect>,
 }
 
 impl App {
@@ -100,23 +106,32 @@ impl App {
             msg_tx,
             has_image_support,
             media_controls: None,
+
+            show_visuals: true,
+            progress_bar_area: None,
         }
     }
 
     /// Returns true when the app should quit.
     pub async fn handle_event(&mut self, event: Event) -> Result<bool> {
-        if let Event::Key(key) = event {
-            if key.kind != KeyEventKind::Press {
-                return Ok(false);
-            }
-            match self.mode {
-                AppMode::Searching => self.handle_search_key(key.code).await?,
-                AppMode::Normal => {
-                    if self.handle_normal_key(key.code, key.modifiers).await? {
-                        return Ok(true);
+        match event {
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    return Ok(false);
+                }
+                match self.mode {
+                    AppMode::Searching => self.handle_search_key(key.code).await?,
+                    AppMode::Normal => {
+                        if self.handle_normal_key(key.code, key.modifiers).await? {
+                            return Ok(true);
+                        }
                     }
                 }
             }
+            Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column, row, .. }) => {
+                self.handle_mouse_click(column, row).await?;
+            }
+            _ => {}
         }
         Ok(false)
     }
@@ -146,6 +161,9 @@ impl App {
     async fn handle_normal_key(&mut self, key: KeyCode, _mods: KeyModifiers) -> Result<bool> {
         match key {
             KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('d') => {
+                self.show_visuals = !self.show_visuals;
+            }
             KeyCode::Char('/') | KeyCode::Char('s') => {
                 self.mode = AppMode::Searching;
             }
@@ -184,20 +202,11 @@ impl App {
             KeyCode::Char('-') => {
                 self.change_volume(-5).await?;
             }
-            KeyCode::Left => {
-                let new_pos = (self.current_position() - 10.0).max(0.0);
-                self.paused_elapsed = new_pos;
-                if !self.is_paused {
-                    self.play_start = Some(Instant::now());
-                }
-                self.player.seek(-10.0).await.ok();
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.seek_by(-5.0).await?;
             }
-            KeyCode::Right => {
-                self.paused_elapsed = self.current_position() + 10.0;
-                if !self.is_paused {
-                    self.play_start = Some(Instant::now());
-                }
-                self.player.seek(10.0).await.ok();
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.seek_by(5.0).await?;
             }
             _ => {}
         }
@@ -489,5 +498,32 @@ impl App {
             .map(|s| s.elapsed().as_secs_f64())
             .unwrap_or(0.0);
         self.paused_elapsed + running
+    }
+
+    async fn seek_by(&mut self, delta: f64) -> Result<()> {
+        let new_pos = (self.current_position() + delta).max(0.0);
+        self.paused_elapsed = new_pos;
+        if !self.is_paused {
+            self.play_start = Some(Instant::now());
+        }
+        self.player.seek_abs(new_pos).await.ok();
+        Ok(())
+    }
+
+    async fn handle_mouse_click(&mut self, col: u16, row: u16) -> Result<()> {
+        let Some(area) = self.progress_bar_area else { return Ok(()); };
+        if row < area.y || row >= area.y + area.height { return Ok(()); }
+        if col < area.x || col >= area.x + area.width { return Ok(()); }
+        let Some(duration) = self.now_playing.as_ref().and_then(|t| t.duration) else {
+            return Ok(());
+        };
+        let ratio = (col - area.x) as f64 / area.width as f64;
+        let target = (ratio * duration).max(0.0);
+        self.paused_elapsed = target;
+        if !self.is_paused {
+            self.play_start = Some(Instant::now());
+        }
+        self.player.seek_abs(target).await.ok();
+        Ok(())
     }
 }

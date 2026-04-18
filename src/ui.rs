@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 use ratatui_image::{protocol::StatefulProtocol, Resize, StatefulImage};
@@ -11,20 +11,21 @@ use ratatui_image::{protocol::StatefulProtocol, Resize, StatefulImage};
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
-    // Queue box height: 0 when empty, else capped at 7 rows (borders + 5 items).
     let queue_height = if app.queue.is_empty() {
         0
     } else {
         (app.queue.len() as u16 + 2).min(7)
     };
+    let progress_height: u16 = if app.now_playing.is_some() { 1 } else { 0 };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),            // search bar
-            Constraint::Min(0),               // content
-            Constraint::Length(queue_height), // queue panel
-            Constraint::Length(3),            // status bar
+            Constraint::Length(3),               // search bar
+            Constraint::Min(0),                  // content
+            Constraint::Length(queue_height),    // queue panel
+            Constraint::Length(progress_height), // progress bar
+            Constraint::Length(3),               // status bar
         ])
         .split(area);
 
@@ -33,7 +34,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if queue_height > 0 {
         render_queue(frame, app, chunks[2]);
     }
-    render_status_bar(frame, app, chunks[3]);
+    if progress_height > 0 {
+        render_progress(frame, app, chunks[3]);
+    }
+    render_status_bar(frame, app, chunks[4]);
 }
 
 fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -196,20 +200,22 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         (None, inner)
     };
 
-    // Render thumbnail if supported
+    // Render thumbnail if supported and visuals are enabled.
     if let Some(t_area) = thumb_area {
-        let vid_id = result.id.clone();
-        if let Some(protocol) = app.thumbnail_protocols.get_mut(&vid_id) {
-            let img = StatefulImage::<StatefulProtocol>::new().resize(Resize::Fit(None));
-            frame.render_stateful_widget(img, t_area, protocol);
-        } else {
-            let msg = if app.thumbnails_loading.contains(&vid_id) {
-                "Loading thumbnail..."
+        if app.show_visuals {
+            let vid_id = result.id.clone();
+            if let Some(protocol) = app.thumbnail_protocols.get_mut(&vid_id) {
+                let img = StatefulImage::<StatefulProtocol>::new().resize(Resize::Fit(None));
+                frame.render_stateful_widget(img, t_area, protocol);
             } else {
-                "No thumbnail available"
-            };
-            let p = Paragraph::new(msg).style(Style::default().fg(Color::DarkGray));
-            frame.render_widget(p, t_area);
+                let msg = if app.thumbnails_loading.contains(&vid_id) {
+                    "Loading thumbnail..."
+                } else {
+                    "No thumbnail available"
+                };
+                let p = Paragraph::new(msg).style(Style::default().fg(Color::DarkGray));
+                frame.render_widget(p, t_area);
+            }
         }
     }
 
@@ -291,6 +297,23 @@ fn render_queue(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(list, area);
 }
 
+fn render_progress(frame: &mut Frame, app: &mut App, area: Rect) {
+    let pos = app.current_position();
+    let duration = app.now_playing.as_ref().and_then(|t| t.duration).unwrap_or(0.0);
+    let ratio = if duration > 0.0 { (pos / duration).clamp(0.0, 1.0) } else { 0.0 };
+
+    let label = format!("{} / {}", fmt_duration(pos as u64), fmt_duration(duration as u64));
+
+    let gauge = Gauge::default()
+        .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
+        .ratio(ratio)
+        .label(label)
+        .use_unicode(true);
+
+    frame.render_widget(gauge, area);
+    app.progress_bar_area = Some(area);
+}
+
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let (text, style) = if let Some(ref track) = app.now_playing {
         let icon = if app.is_paused { "|| " } else { ">  " };
@@ -301,7 +324,7 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             format!("  |  Next: {}", truncate(&app.queue[0].title, 25))
         };
         let t = format!(
-            " {} {}  |  {} elapsed  |  vol {}%{}  |  [Space] pause  [< >] seek  [[] []] skip  [f] queue  [q] quit",
+            " {} {}  |  {} elapsed  |  vol {}%{}  |  [Space] pause  [h/l] -/+5s  [[] []] skip  [f] queue  [q] quit",
             icon,
             truncate(&track.title, 30),
             pos,
