@@ -126,66 +126,76 @@ fn player_thread(rx: mpsc::Receiver<PlayerCmd>, event_tx: UnboundedSender<AppMes
     let mut mpv: Option<MpvProcess> = None;
     let mut volume: i32 = 100;
 
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            PlayerCmd::Play(url) => {
-                // Kill previous instance if any.
-                if let Some(ref mut m) = mpv {
-                    m.kill();
-                }
-
-                let _ = event_tx.send(AppMessage::AudioLoading);
-
-                match MpvProcess::spawn(&url) {
-                    Err(e) => {
-                        let _ = event_tx.send(AppMessage::AudioError(e.to_string()));
-                        mpv = None;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(cmd) => match cmd {
+                PlayerCmd::Play(url) => {
+                    // Kill previous instance — set mpv to None first so the
+                    // polling branch never fires AudioFinished for the old process.
+                    if let Some(mut m) = mpv.take() {
+                        m.kill();
                     }
-                    Ok(mut proc) => {
-                        // Wait up to 5 s for the IPC socket to appear.
-                        if wait_for_socket(Duration::from_secs(5)) {
-                            // Set initial volume.
-                            let _ = ipc_send(json!({
-                                "command": ["set_property", "volume", volume]
-                            }));
-                            let _ = event_tx.send(AppMessage::AudioReady);
-                            mpv = Some(proc);
-                        } else {
-                            proc.kill();
-                            let _ = event_tx
-                                .send(AppMessage::AudioError("mpv socket timeout".to_string()));
-                            mpv = None;
+
+                    let _ = event_tx.send(AppMessage::AudioLoading);
+
+                    match MpvProcess::spawn(&url) {
+                        Err(e) => {
+                            let _ = event_tx.send(AppMessage::AudioError(e.to_string()));
+                        }
+                        Ok(mut proc) => {
+                            if wait_for_socket(Duration::from_secs(5)) {
+                                let _ = ipc_send(json!({
+                                    "command": ["set_property", "volume", volume]
+                                }));
+                                let _ = event_tx.send(AppMessage::AudioReady);
+                                mpv = Some(proc);
+                            } else {
+                                proc.kill();
+                                let _ = event_tx
+                                    .send(AppMessage::AudioError("mpv socket timeout".to_string()));
+                            }
                         }
                     }
                 }
-            }
 
-            PlayerCmd::TogglePause => {
-                let _ = ipc_send(json!({"command": ["cycle", "pause"]}));
-            }
-
-            PlayerCmd::SetVolume(v) => {
-                volume = v;
-                let _ = ipc_send(json!({"command": ["set_property", "volume", v]}));
-            }
-
-            PlayerCmd::Seek(secs) => {
-                let _ = ipc_send(json!({"command": ["seek", secs, "relative"]}));
-            }
-
-            PlayerCmd::Stop => {
-                if let Some(ref mut m) = mpv {
-                    m.kill();
+                PlayerCmd::TogglePause => {
+                    let _ = ipc_send(json!({"command": ["cycle", "pause"]}));
                 }
-                mpv = None;
+
+                PlayerCmd::SetVolume(v) => {
+                    volume = v;
+                    let _ = ipc_send(json!({"command": ["set_property", "volume", v]}));
+                }
+
+                PlayerCmd::Seek(secs) => {
+                    let _ = ipc_send(json!({"command": ["seek", secs, "relative"]}));
+                }
+
+                PlayerCmd::Stop => {
+                    if let Some(mut m) = mpv.take() {
+                        m.kill();
+                    }
+                }
+
+                PlayerCmd::Quit => {
+                    if let Some(mut m) = mpv.take() {
+                        m.kill();
+                    }
+                    break;
+                }
+            },
+
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Check if mpv exited naturally (track finished).
+                if let Some(ref mut m) = mpv {
+                    if let Ok(Some(_)) = m.child.try_wait() {
+                        mpv = None;
+                        let _ = event_tx.send(AppMessage::AudioFinished);
+                    }
+                }
             }
 
-            PlayerCmd::Quit => {
-                if let Some(ref mut m) = mpv {
-                    m.kill();
-                }
-                break;
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 }

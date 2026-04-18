@@ -11,18 +11,29 @@ use ratatui_image::{protocol::StatefulProtocol, Resize, StatefulImage};
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
+    // Queue box height: 0 when empty, else capped at 7 rows (borders + 5 items).
+    let queue_height = if app.queue.is_empty() {
+        0
+    } else {
+        (app.queue.len() as u16 + 2).min(7)
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // search bar
-            Constraint::Min(0),    // content
-            Constraint::Length(3), // status / now playing
+            Constraint::Length(3),            // search bar
+            Constraint::Min(0),               // content
+            Constraint::Length(queue_height), // queue panel
+            Constraint::Length(3),            // status bar
         ])
         .split(area);
 
     render_search_bar(frame, app, chunks[0]);
     render_content(frame, app, chunks[1]);
-    render_status_bar(frame, app, chunks[2]);
+    if queue_height > 0 {
+        render_queue(frame, app, chunks[2]);
+    }
+    render_status_bar(frame, app, chunks[3]);
 }
 
 fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -52,7 +63,7 @@ fn render_content(frame: &mut Frame, app: &mut App, area: Rect) {
         } else if let Some(ref m) = app.status_message {
             m.as_str()
         } else {
-            "Press / to search for music on YouTube\n\n[j/k or arrows] navigate  [Enter] play  [Space] pause  [</>] seek  [+/-] volume  [q] quit"
+            "Press / to search for music on YouTube\n\n[j/k or arrows] navigate  [Enter] play now  [f] add to queue  [Space] pause  [</>] seek  [+/-] volume  [q] quit"
         };
         let vert = Layout::default()
             .direction(Direction::Vertical)
@@ -81,6 +92,8 @@ fn render_content(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_results(frame: &mut Frame, app: &App, area: Rect) {
     let playing_id = app.now_playing.as_ref().map(|np| np.id.as_str());
+    let queued_ids: std::collections::HashSet<&str> =
+        app.queue.iter().map(|v| v.id.as_str()).collect();
 
     let items: Vec<ListItem> = app
         .search_results
@@ -88,10 +101,11 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, r)| {
             let is_playing = playing_id == Some(r.id.as_str());
+            let in_queue = queued_ids.contains(r.id.as_str());
             let has_thumb = app.thumbnail_protocols.contains_key(&r.id);
             let loading_thumb = app.thumbnails_loading.contains(&r.id);
 
-            let play_icon = if is_playing { ">> " } else { "   " };
+            let play_icon = if is_playing { ">> " } else if in_queue { "+  " } else { "   " };
             let thumb_icon = if !app.has_image_support {
                 "  "
             } else if has_thumb {
@@ -108,16 +122,25 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
             let dur = r.duration.map(|d| fmt_duration(d as u64)).unwrap_or_default();
             let views = r.view_count.map(fmt_views).unwrap_or_default();
 
-            let title_style = if is_playing {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
+            let (title_style, play_icon_style) = if is_playing {
+                (
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Green),
+                )
+            } else if in_queue {
+                (
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Yellow),
+                )
             } else {
-                Style::default().add_modifier(Modifier::BOLD)
+                (
+                    Style::default().add_modifier(Modifier::BOLD),
+                    Style::default(),
+                )
             };
 
             let title_line = Line::from(vec![
-                Span::styled(play_icon, Style::default().fg(Color::Green)),
+                Span::styled(play_icon, play_icon_style),
                 Span::styled(thumb_icon, Style::default().fg(Color::Blue)),
                 Span::raw(num),
                 Span::styled(title, title_style),
@@ -134,10 +157,15 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
     let mut state = ListState::default();
     state.select(Some(app.selected_index));
 
+    let queue_hint = if app.queue.is_empty() {
+        String::new()
+    } else {
+        format!(" | Queue: {} ", app.queue.len())
+    };
     let list = List::new(items)
         .block(
             Block::default()
-                .title(format!(" Results ({}) ", app.search_results.len()))
+                .title(format!(" Results ({}){} ", app.search_results.len(), queue_hint))
                 .borders(Borders::ALL),
         )
         .highlight_style(
@@ -218,8 +246,12 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "[Enter] Play this track",
+            "[Enter] Play now (clear queue)",
             Style::default().fg(Color::Green),
+        )),
+        Line::from(Span::styled(
+            "[f] Add to queue",
+            Style::default().fg(Color::Yellow),
         )),
     ];
 
@@ -227,20 +259,58 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(p, info_area);
 }
 
+fn render_queue(frame: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = app
+        .queue
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let dur = v.duration.map(|d| fmt_duration(d as u64)).unwrap_or_default();
+            let channel = v.channel_name().to_string();
+            let line = Line::from(vec![
+                Span::styled(
+                    format!("{:2}. ", i + 1),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(truncate(&v.title, 50), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("  {} · {}", channel, dur),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .title(format!(" Queue ({}) — [[] prev  []] next ", app.queue.len()))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+    frame.render_widget(list, area);
+}
+
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let (text, style) = if let Some(ref track) = app.now_playing {
         let icon = if app.is_paused { "|| " } else { ">  " };
         let pos = fmt_duration(app.current_position() as u64);
+        let queue_info = if app.queue.is_empty() {
+            String::new()
+        } else {
+            format!("  |  Next: {}", truncate(&app.queue[0].title, 25))
+        };
         let t = format!(
-            " {} {}  |  {} elapsed  |  vol {}%  |  [Space] pause  [< >] seek  [+ -] vol  [q] quit",
+            " {} {}  |  {} elapsed  |  vol {}%{}  |  [Space] pause  [< >] seek  [[] []] skip  [f] queue  [q] quit",
             icon,
-            truncate(&track.title, 38),
+            truncate(&track.title, 30),
             pos,
             app.volume,
+            queue_info,
         );
         (t, Style::default().fg(Color::Green))
     } else {
-        let t = " No track playing  |  [/] search  [arrows/jk] navigate  [Enter] play  [q] quit"
+        let t = " No track playing  |  [/] search  [arrows/jk] navigate  [Enter] play  [f] add to queue  [q] quit"
             .to_string();
         (t, Style::default().fg(Color::DarkGray))
     };

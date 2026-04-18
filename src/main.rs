@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
             }
         }
         while let Ok(msg) = msg_rx.try_recv() {
-            app.handle_message(msg);
+            app.handle_message(msg).await?;
         }
         while let Ok(action) = media_rx.try_recv() {
             app.handle_media_action(action).await?;
@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
             Some(event) = ev_rx.recv() => {
                 if app.handle_event(event).await? { break; }
             }
-            Some(msg) = msg_rx.recv() => { app.handle_message(msg); }
+            Some(msg) = msg_rx.recv() => { app.handle_message(msg).await?; }
             Some(action) = media_rx.recv() => { app.handle_media_action(action).await?; }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {}
         }

@@ -5,7 +5,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use image::DynamicImage;
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use souvlaki::{MediaControls, MediaMetadata, MediaPlayback};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -20,6 +20,8 @@ pub enum AppMessage {
     AudioReady,
     /// Audio thread encountered an error
     AudioError(String),
+    /// mpv process exited naturally (track finished)
+    AudioFinished,
 }
 
 /// Simple Send-safe enum used to forward media key events from the
@@ -49,6 +51,8 @@ pub struct App {
 
     pub player: Player,
     pub now_playing: Option<VideoResult>,
+    pub queue: VecDeque<VideoResult>,
+    pub history: Vec<VideoResult>,
     pub is_paused: bool,
     pub volume: i32,
     pub play_start: Option<Instant>,
@@ -81,6 +85,8 @@ impl App {
 
             player,
             now_playing: None,
+            queue: VecDeque::new(),
+            history: Vec::new(),
             is_paused: false,
             volume: 100,
             play_start: None,
@@ -160,6 +166,15 @@ impl App {
             KeyCode::Enter => {
                 self.play_selected().await?;
             }
+            KeyCode::Char('f') => {
+                self.queue_selected().await?;
+            }
+            KeyCode::Char(']') => {
+                self.skip_next().await?;
+            }
+            KeyCode::Char('[') => {
+                self.skip_prev().await?;
+            }
             KeyCode::Char(' ') => {
                 self.toggle_pause().await?;
             }
@@ -237,7 +252,7 @@ impl App {
         }
     }
 
-    pub fn handle_message(&mut self, msg: AppMessage) {
+    pub async fn handle_message(&mut self, msg: AppMessage) -> Result<()> {
         match msg {
             AppMessage::SearchResults(results) => {
                 self.is_searching = false;
@@ -282,7 +297,25 @@ impl App {
                 self.play_start = None;
                 self.update_media_controls();
             }
+            AppMessage::AudioFinished => {
+                if let Some(done) = self.now_playing.take() {
+                    self.history.push(done);
+                }
+                if let Some(next) = self.queue.pop_front() {
+                    let url = next.watch_url();
+                    self.now_playing = Some(next);
+                    self.is_paused = false;
+                    self.play_start = Some(Instant::now());
+                    self.paused_elapsed = 0.0;
+                    self.player.play_url(&url).await?;
+                } else {
+                    self.is_paused = false;
+                    self.play_start = None;
+                }
+                self.update_media_controls();
+            }
         }
+        Ok(())
     }
 
     /// Handle a media key event forwarded from the souvlaki callback.
@@ -357,6 +390,10 @@ impl App {
 
     async fn play_selected(&mut self) -> Result<()> {
         if let Some(result) = self.search_results.get(self.selected_index).cloned() {
+            if let Some(prev) = self.now_playing.take() {
+                self.history.push(prev);
+            }
+            self.queue.clear();
             let url = result.watch_url();
             self.now_playing = Some(result);
             self.is_paused = false;
@@ -364,6 +401,62 @@ impl App {
             self.paused_elapsed = 0.0;
             self.player.play_url(&url).await?;
             self.update_media_controls();
+        }
+        Ok(())
+    }
+
+    async fn skip_next(&mut self) -> Result<()> {
+        if let Some(next) = self.queue.pop_front() {
+            if let Some(current) = self.now_playing.take() {
+                self.history.push(current);
+            }
+            let url = next.watch_url();
+            self.now_playing = Some(next);
+            self.is_paused = false;
+            self.play_start = Some(Instant::now());
+            self.paused_elapsed = 0.0;
+            self.player.play_url(&url).await?;
+            self.update_media_controls();
+        }
+        Ok(())
+    }
+
+    async fn skip_prev(&mut self) -> Result<()> {
+        if let Some(prev) = self.history.pop() {
+            if let Some(current) = self.now_playing.take() {
+                self.queue.push_front(current);
+            }
+            let url = prev.watch_url();
+            self.now_playing = Some(prev);
+            self.is_paused = false;
+            self.play_start = Some(Instant::now());
+            self.paused_elapsed = 0.0;
+            self.player.play_url(&url).await?;
+            self.update_media_controls();
+        }
+        Ok(())
+    }
+
+    async fn queue_selected(&mut self) -> Result<()> {
+        if let Some(result) = self.search_results.get(self.selected_index).cloned() {
+            if self.now_playing.is_none() {
+                // Nothing playing — start immediately without touching the queue.
+                let url = result.watch_url();
+                self.now_playing = Some(result);
+                self.is_paused = false;
+                self.play_start = Some(Instant::now());
+                self.paused_elapsed = 0.0;
+                self.player.play_url(&url).await?;
+                self.update_media_controls();
+            } else {
+                let title = result.title.clone();
+                self.queue.push_back(result);
+                self.status_message = Some(format!(
+                    "Added to queue ({} tracks): {}",
+                    self.queue.len(),
+                    &title[..title.len().min(40)]
+                ));
+            }
         }
         Ok(())
     }
