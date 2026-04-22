@@ -77,6 +77,8 @@ pub struct App {
     pub progress_bar_area: Option<Rect>,
     // Title of the track pending confirmation before playing.
     pub confirm_title: Option<String>,
+
+    pub loop_mode: bool,
 }
 
 impl App {
@@ -113,6 +115,8 @@ impl App {
             show_visuals: true,
             progress_bar_area: None,
             confirm_title: None,
+
+            loop_mode: false,
         }
     }
 
@@ -222,6 +226,11 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => {
                 self.seek_by(5.0).await?;
             }
+            KeyCode::Char('r') => {
+                self.loop_mode = !self.loop_mode;
+                let msg = if self.loop_mode { "Loop ON" } else { "Loop OFF" };
+                self.status_message = Some(msg.to_string());
+            }
             _ => {}
         }
         Ok(false)
@@ -321,21 +330,32 @@ impl App {
                 self.update_media_controls();
             }
             AppMessage::AudioFinished => {
-                if let Some(done) = self.now_playing.take() {
-                    self.history.push(done);
-                }
-                if let Some(next) = self.queue.pop_front() {
-                    let url = next.watch_url();
-                    self.now_playing = Some(next);
-                    self.is_paused = false;
-                    self.play_start = Some(Instant::now());
-                    self.paused_elapsed = 0.0;
-                    self.player.play_url(&url).await?;
+                if self.loop_mode {
+                    if let Some(ref track) = self.now_playing {
+                        let url = track.watch_url();
+                        self.is_paused = false;
+                        self.play_start = Some(Instant::now());
+                        self.paused_elapsed = 0.0;
+                        self.player.play_url(&url).await?;
+                        self.update_media_controls();
+                    }
                 } else {
-                    self.is_paused = false;
-                    self.play_start = None;
+                    if let Some(done) = self.now_playing.take() {
+                        self.history.push(done);
+                    }
+                    if let Some(next) = self.queue.pop_front() {
+                        let url = next.watch_url();
+                        self.now_playing = Some(next);
+                        self.is_paused = false;
+                        self.play_start = Some(Instant::now());
+                        self.paused_elapsed = 0.0;
+                        self.player.play_url(&url).await?;
+                    } else {
+                        self.is_paused = false;
+                        self.play_start = None;
+                    }
+                    self.update_media_controls();
                 }
-                self.update_media_controls();
             }
         }
         Ok(())

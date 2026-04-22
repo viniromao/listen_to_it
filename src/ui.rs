@@ -260,6 +260,7 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(Span::styled("[h/l]   Seek -/+5s",             Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("[[ ]]   Prev / next track",      Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("[+/-]   Volume",                 Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("[r]     Toggle loop",            Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("[d]     Toggle thumbnails",      Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("[q]     Quit",                   Style::default().fg(Color::DarkGray))),
     ];
@@ -338,13 +339,15 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             format!("  |  Next: {}", truncate(&app.queue[0].title, 25))
         };
+        let loop_info = if app.loop_mode { "  |  [LOOP]" } else { "" };
         let t = format!(
-            " {} {}  |  {} elapsed  |  vol {}%{}",
+            " {} {}  |  {} elapsed  |  vol {}%{}{}",
             icon,
             truncate(&track.title, 45),
             pos,
             app.volume,
             queue_info,
+            loop_info,
         );
         (t, Style::default().fg(Color::Green))
     } else {

@@ -20,13 +20,10 @@ mod youtube;
 
 use app::{App, AppMessage, MediaAction};
 
-// current_thread keeps everything on the main thread, which is required because
-// MediaControls (souvlaki) is not Send on all platforms.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     enable_raw_mode()?;
 
-    // Detect terminal image protocol while in raw mode, before alternate screen.
     let (picker, has_image_support) = match Picker::from_query_stdio() {
         Ok(p) => {
             let supported = !matches!(p.protocol_type(), ProtocolType::Halfblocks);
