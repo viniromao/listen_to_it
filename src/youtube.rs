@@ -1,5 +1,5 @@
-use anyhow::Result;
-use rusty_ytdl::search::{SearchOptions, SearchResult, SearchType, YouTube};
+use anyhow::{Context, Result};
+use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub struct VideoResult {
@@ -11,13 +11,18 @@ pub struct VideoResult {
     pub channel: Option<String>,
     pub uploader: Option<String>,
     pub thumbnail: Option<String>,
+    pub is_playlist: bool,
 }
 
 impl VideoResult {
     pub fn watch_url(&self) -> String {
-        self.url
-            .clone()
-            .unwrap_or_else(|| format!("https://www.youtube.com/watch?v={}", self.id))
+        self.url.clone().unwrap_or_else(|| {
+            if self.is_playlist {
+                format!("https://www.youtube.com/playlist?list={}", self.id)
+            } else {
+                format!("https://www.youtube.com/watch?v={}", self.id)
+            }
+        })
     }
 
     pub fn thumbnail_url(&self) -> String {
@@ -35,47 +40,114 @@ impl VideoResult {
 }
 
 pub async fn search(query: &str, max_results: usize) -> Result<Vec<VideoResult>> {
-    let yt = YouTube::new()?;
+    let search_term = format!("ytsearch{}:{}", max_results, query);
+    let output = tokio::process::Command::new("yt-dlp")
+        .args(["-J", "--flat-playlist", "--no-warnings", &search_term])
+        .output()
+        .await
+        .context("failed to run yt-dlp")?;
 
-    let raw = yt
-        .search(
-            query,
-            Some(&SearchOptions {
-                limit: max_results as u64,
-                search_type: SearchType::Video,
-                safe_search: false,
-            }),
-        )
-        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "yt-dlp search failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
 
-    let results = raw
-        .into_iter()
-        .filter_map(|r| {
-            if let SearchResult::Video(v) = r {
-                // duration is in milliseconds
-                let duration_secs = if v.duration > 0 {
-                    Some(v.duration as f64 / 1000.0)
-                } else {
-                    None
-                };
+    let json: Value =
+        serde_json::from_slice(&output.stdout).context("failed to parse yt-dlp output")?;
 
-                let thumbnail = v.thumbnails.into_iter().next().map(|t| t.url);
+    Ok(json["entries"]
+        .as_array()
+        .map(|entries| entries.iter().filter_map(parse_entry).collect())
+        .unwrap_or_default())
+}
 
-                Some(VideoResult {
-                    id: v.id,
-                    title: v.title,
-                    url: Some(v.url),
-                    duration: duration_secs,
-                    view_count: Some(v.views),
-                    channel: Some(v.channel.name),
-                    uploader: None,
-                    thumbnail,
+pub async fn fetch_playlist(url: &str) -> Result<Vec<VideoResult>> {
+    let output = tokio::process::Command::new("yt-dlp")
+        .args(["-J", "--flat-playlist", "--no-warnings", url])
+        .output()
+        .await
+        .context("failed to run yt-dlp")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "yt-dlp playlist fetch failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let json: Value =
+        serde_json::from_slice(&output.stdout).context("failed to parse yt-dlp output")?;
+
+    Ok(json["entries"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| {
+                    // Skip nested playlists inside playlists
+                    if e["ie_key"].as_str() == Some("YoutubePlaylist") {
+                        return None;
+                    }
+                    let id = e["id"].as_str()?.to_string();
+                    let title = e["title"].as_str().unwrap_or("Unknown").to_string();
+                    let url = e["url"]
+                        .as_str()
+                        .or_else(|| e["webpage_url"].as_str())
+                        .map(|s| s.to_string());
+                    let channel = e["channel"]
+                        .as_str()
+                        .or_else(|| e["uploader"].as_str())
+                        .map(|s| s.to_string());
+                    Some(VideoResult {
+                        id,
+                        title,
+                        url,
+                        duration: e["duration"].as_f64(),
+                        view_count: e["view_count"].as_u64(),
+                        channel,
+                        uploader: None,
+                        thumbnail: e["thumbnail"].as_str().map(|s| s.to_string()),
+                        is_playlist: false,
+                    })
                 })
-            } else {
-                None
-            }
+                .collect()
         })
-        .collect();
+        .unwrap_or_default())
+}
 
-    Ok(results)
+fn parse_entry(e: &Value) -> Option<VideoResult> {
+    let ie_key = e["ie_key"].as_str().unwrap_or("");
+    // Accept videos and playlists; skip channels and other types
+    if !ie_key.is_empty() && ie_key != "Youtube" && ie_key != "YoutubePlaylist" {
+        return None;
+    }
+    let is_playlist = ie_key == "YoutubePlaylist";
+
+    let id = e["id"].as_str()?.to_string();
+    let title = e["title"].as_str().unwrap_or("Unknown").to_string();
+    let url = e["url"]
+        .as_str()
+        .or_else(|| e["webpage_url"].as_str())
+        .map(|s| s.to_string());
+    let channel = e["channel"]
+        .as_str()
+        .or_else(|| e["uploader"].as_str())
+        .map(|s| s.to_string());
+    let duration = e["duration"].as_f64();
+    let view_count = e["view_count"].as_u64();
+    let thumbnail = e["thumbnail"].as_str().map(|s| s.to_string());
+
+    Some(VideoResult {
+        id,
+        title,
+        url,
+        duration,
+        view_count,
+        channel,
+        uploader: None,
+        thumbnail,
+        is_playlist,
+    })
 }

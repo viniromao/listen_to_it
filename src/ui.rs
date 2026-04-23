@@ -18,6 +18,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         (app.queue.len() as u16 + 2).min(7)
     };
     let progress_height: u16 = if app.now_playing.is_some() { 1 } else { 0 };
+    let pos_now = app.current_position();
+    let has_chapter = app.now_playing.is_some()
+        && app.chapters.iter()
+            .filter(|c| c.start_time <= pos_now)
+            .last()
+            .map(|c| !c.title.is_empty())
+            .unwrap_or(false);
+    let status_height: u16 = if has_chapter { 4 } else { 3 };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -26,7 +34,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Constraint::Min(0),                  // content
             Constraint::Length(queue_height),    // queue panel
             Constraint::Length(progress_height), // progress bar
-            Constraint::Length(3),               // status bar
+            Constraint::Length(status_height),   // status bar
         ])
         .split(area);
 
@@ -115,7 +123,9 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
             let loading_thumb = app.thumbnails_loading.contains(&r.id);
 
             let play_icon = if is_playing { ">> " } else if in_queue { "+  " } else { "   " };
-            let thumb_icon = if !app.has_image_support {
+            let thumb_icon = if r.is_playlist {
+                "≡  "
+            } else if !app.has_image_support {
                 "  "
             } else if has_thumb {
                 "[] "
@@ -259,6 +269,7 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(Span::styled("[Space] Pause / resume",         Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("[h/l]   Seek -/+5s",             Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("[[ ]]   Prev / next track",      Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("[{/}]   Prev / next chapter",    Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("[+/-]   Volume",                 Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("[r]     Toggle loop",            Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("[d]     Toggle thumbnails",      Style::default().fg(Color::DarkGray))),
@@ -313,34 +324,67 @@ fn render_progress(frame: &mut Frame, app: &mut App, area: Rect) {
     let filled = (ratio * bar_w as f64).round() as usize;
     let filled = filled.clamp(0, bar_w);
 
+    let marker_cols: std::collections::HashSet<usize> = if duration > 0.0 {
+        app.chapters.iter()
+            .filter(|c| c.start_time > 0.5)
+            .map(|c| ((c.start_time / duration) * bar_w as f64).floor() as usize)
+            .filter(|&p| p < bar_w)
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    let bar: Vec<(char, Color)> = (0..bar_w)
+        .map(|i| {
+            if marker_cols.contains(&i) {
+                ('▴', Color::Yellow)
+            } else if filled > 0 && i + 1 == filled {
+                ('╸', Color::White)
+            } else if filled > 0 && i + 1 < filled {
+                ('━', Color::Cyan)
+            } else {
+                ('╌', Color::DarkGray)
+            }
+        })
+        .collect();
+
     let mut spans = Vec::new();
-    if filled > 1 {
-        spans.push(Span::styled("━".repeat(filled - 1), Style::default().fg(Color::Cyan)));
-    }
-    if filled > 0 {
-        spans.push(Span::styled("╸", Style::default().fg(Color::White)));
-    }
-    if filled < bar_w {
-        spans.push(Span::styled("╌".repeat(bar_w - filled), Style::default().fg(Color::DarkGray)));
+    if !bar.is_empty() {
+        let (mut cur_color, mut buf) = (bar[0].1, String::new());
+        for (c, color) in &bar {
+            if *color == cur_color {
+                buf.push(*c);
+            } else {
+                spans.push(Span::styled(buf.clone(), Style::default().fg(cur_color)));
+                buf = c.to_string();
+                cur_color = *color;
+            }
+        }
+        if !buf.is_empty() {
+            spans.push(Span::styled(buf, Style::default().fg(cur_color)));
+        }
     }
     spans.push(Span::styled(label, Style::default().fg(Color::White)));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    // Only the bar portion is clickable, not the label.
     app.progress_bar_area = Some(Rect { width: bar_w as u16, ..area });
 }
 
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let (text, style) = if let Some(ref track) = app.now_playing {
+    let block = Block::default().borders(Borders::ALL);
+
+    if let Some(ref track) = app.now_playing {
         let icon = if app.is_paused { "|| " } else { ">  " };
-        let pos = fmt_duration(app.current_position() as u64);
+        let pos_val = app.current_position();
+        let pos = fmt_duration(pos_val as u64);
         let queue_info = if app.queue.is_empty() {
             String::new()
         } else {
             format!("  |  Next: {}", truncate(&app.queue[0].title, 25))
         };
         let loop_info = if app.loop_mode { "  |  [LOOP]" } else { "" };
-        let t = format!(
+
+        let mut lines = vec![Line::from(Span::raw(format!(
             " {} {}  |  {} elapsed  |  vol {}%{}{}",
             icon,
             truncate(&track.title, 45),
@@ -348,18 +392,29 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             app.volume,
             queue_info,
             loop_info,
-        );
-        (t, Style::default().fg(Color::Green))
-    } else {
-        let t = " No track playing  |  [/] search  [j/k] navigate  [Enter] play"
-            .to_string();
-        (t, Style::default().fg(Color::DarkGray))
-    };
+        )))];
 
-    let p = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL))
-        .style(style);
-    frame.render_widget(p, area);
+        if let Some(ch) = app.chapters.iter()
+            .filter(|c| c.start_time <= pos_val)
+            .last()
+            .filter(|c| !c.title.is_empty())
+        {
+            lines.push(Line::from(vec![
+                Span::styled("   ♪ ", Style::default().fg(Color::Yellow)),
+                Span::styled(truncate(&ch.title, 70), Style::default().fg(Color::Yellow)),
+            ]));
+        }
+
+        let p = Paragraph::new(lines)
+            .block(block)
+            .style(Style::default().fg(Color::Green));
+        frame.render_widget(p, area);
+    } else {
+        let p = Paragraph::new(" No track playing  |  [/] search  [j/k] navigate  [Enter] play")
+            .block(block)
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(p, area);
+    }
 }
 
 fn render_confirm_dialog(frame: &mut Frame, app: &App, area: Rect) {

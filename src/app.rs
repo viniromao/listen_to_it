@@ -25,6 +25,15 @@ pub enum AppMessage {
     AudioError(String),
     /// mpv process exited naturally (track finished)
     AudioFinished,
+    ChaptersLoaded { url: String, chapters: Vec<Chapter> },
+    MoreResults(Vec<VideoResult>),
+    PlaylistLoaded { videos: Vec<VideoResult>, play_immediately: bool },
+}
+
+#[derive(Debug, Clone)]
+pub struct Chapter {
+    pub start_time: f64,
+    pub title: String,
 }
 
 /// Simple Send-safe enum used to forward media key events from the
@@ -79,6 +88,9 @@ pub struct App {
     pub confirm_title: Option<String>,
 
     pub loop_mode: bool,
+    pub chapters: Vec<Chapter>,
+    pub search_query: String,
+    pub is_loading_more: bool,
 }
 
 impl App {
@@ -117,6 +129,9 @@ impl App {
             confirm_title: None,
 
             loop_mode: false,
+            chapters: Vec::new(),
+            search_query: String::new(),
+            is_loading_more: false,
         }
     }
 
@@ -188,6 +203,10 @@ impl App {
                 {
                     self.selected_index += 1;
                     self.request_selected_thumbnail();
+                    let remaining = self.search_results.len().saturating_sub(self.selected_index + 1);
+                    if remaining <= 2 && !self.is_loading_more && !self.search_query.is_empty() {
+                        self.load_more_results();
+                    }
                 }
             }
             KeyCode::Enter => {
@@ -231,6 +250,12 @@ impl App {
                 let msg = if self.loop_mode { "Loop ON" } else { "Loop OFF" };
                 self.status_message = Some(msg.to_string());
             }
+            KeyCode::Char('}') => {
+                self.seek_to_next_chapter().await?;
+            }
+            KeyCode::Char('{') => {
+                self.seek_to_prev_chapter().await?;
+            }
             _ => {}
         }
         Ok(false)
@@ -238,6 +263,7 @@ impl App {
 
     async fn start_search(&mut self) {
         self.is_searching = true;
+        self.is_loading_more = false;
         self.status_message = Some("Searching...".to_string());
         self.search_results.clear();
         self.selected_index = 0;
@@ -245,10 +271,11 @@ impl App {
         self.thumbnails_loading.clear();
         self.thumbnails_failed.clear();
 
-        let query = self.search_input.clone();
+        self.search_query = self.search_input.clone();
+        let query = self.search_query.clone();
         let tx = self.msg_tx.clone();
         tokio::spawn(async move {
-            match crate::youtube::search(&query, 10).await {
+            match crate::youtube::search(&query, 20).await {
                 Ok(results) => {
                     let _ = tx.send(AppMessage::SearchResults(results));
                 }
@@ -282,6 +309,49 @@ impl App {
             let url = result.thumbnail_url();
             self.request_thumbnail_for(&id, &url);
         }
+    }
+
+    fn load_more_results(&mut self) {
+        self.is_loading_more = true;
+        let query = self.search_query.clone();
+        let total = self.search_results.len() + 3;
+        let tx = self.msg_tx.clone();
+        tokio::spawn(async move {
+            let results = crate::youtube::search(&query, total).await.unwrap_or_default();
+            let _ = tx.send(AppMessage::MoreResults(results));
+        });
+    }
+
+    fn fetch_chapters_for(&self, url: &str) {
+        let tx = self.msg_tx.clone();
+        let url = url.to_string();
+        tokio::spawn(async move {
+            let output = tokio::process::Command::new("yt-dlp")
+                .args(["-j", "--no-playlist", "--no-warnings", &url])
+                .output()
+                .await;
+            let chapters = match output {
+                Ok(out) if out.status.success() => {
+                    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
+                        .unwrap_or(serde_json::Value::Null);
+                    json["chapters"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|c| {
+                                    Some(Chapter {
+                                        start_time: c["start_time"].as_f64()?,
+                                        title: c["title"].as_str().unwrap_or("").to_string(),
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                }
+                _ => vec![],
+            };
+            let _ = tx.send(AppMessage::ChaptersLoaded { url, chapters });
+        });
     }
 
     pub async fn handle_message(&mut self, msg: AppMessage) -> Result<()> {
@@ -349,13 +419,65 @@ impl App {
                         self.is_paused = false;
                         self.play_start = Some(Instant::now());
                         self.paused_elapsed = 0.0;
+                        self.chapters.clear();
                         self.player.play_url(&url).await?;
+                        self.fetch_chapters_for(&url);
                     } else {
                         self.is_paused = false;
                         self.play_start = None;
+                        self.chapters.clear();
                     }
                     self.update_media_controls();
                 }
+            }
+            AppMessage::ChaptersLoaded { url, chapters } => {
+                if self.now_playing.as_ref().map(|t| t.watch_url()) == Some(url) {
+                    self.chapters = chapters;
+                }
+            }
+            AppMessage::PlaylistLoaded { videos, play_immediately } => {
+                self.status_message = None;
+                if videos.is_empty() {
+                    self.status_message = Some("Playlist is empty or could not be loaded.".to_string());
+                    return Ok(());
+                }
+                let total = videos.len();
+                if play_immediately {
+                    if let Some(prev) = self.now_playing.take() {
+                        self.history.push(prev);
+                    }
+                    self.queue.clear();
+                    let mut iter = videos.into_iter();
+                    if let Some(first) = iter.next() {
+                        let url = first.watch_url();
+                        self.now_playing = Some(first);
+                        self.is_paused = false;
+                        self.play_start = Some(Instant::now());
+                        self.paused_elapsed = 0.0;
+                        self.chapters.clear();
+                        self.player.play_url(&url).await?;
+                        self.fetch_chapters_for(&url);
+                    }
+                    for video in iter {
+                        self.queue.push_back(video);
+                    }
+                    self.update_media_controls();
+                } else {
+                    for video in videos {
+                        self.queue.push_back(video);
+                    }
+                    self.status_message = Some(format!("Added {} tracks to queue", total));
+                }
+            }
+            AppMessage::MoreResults(all_results) => {
+                self.is_loading_more = false;
+                let existing: std::collections::HashSet<String> =
+                    self.search_results.iter().map(|r| r.id.clone()).collect();
+                let new_results: Vec<_> = all_results
+                    .into_iter()
+                    .filter(|r| !existing.contains(&r.id))
+                    .collect();
+                self.search_results.extend(new_results);
             }
         }
         Ok(())
@@ -433,6 +555,18 @@ impl App {
 
     async fn play_selected(&mut self) -> Result<()> {
         if let Some(result) = self.search_results.get(self.selected_index).cloned() {
+            if result.is_playlist {
+                let url = result.watch_url();
+                self.status_message = Some(format!("Loading playlist \"{}\"...", &result.title.chars().take(35).collect::<String>()));
+                let tx = self.msg_tx.clone();
+                tokio::spawn(async move {
+                    match crate::youtube::fetch_playlist(&url).await {
+                        Ok(videos) => { let _ = tx.send(AppMessage::PlaylistLoaded { videos, play_immediately: true }); }
+                        Err(e) => { let _ = tx.send(AppMessage::SearchError(e.to_string())); }
+                    }
+                });
+                return Ok(());
+            }
             if let Some(prev) = self.now_playing.take() {
                 self.history.push(prev);
             }
@@ -442,7 +576,9 @@ impl App {
             self.is_paused = false;
             self.play_start = Some(Instant::now());
             self.paused_elapsed = 0.0;
+            self.chapters.clear();
             self.player.play_url(&url).await?;
+            self.fetch_chapters_for(&url);
             self.update_media_controls();
         }
         Ok(())
@@ -458,7 +594,9 @@ impl App {
             self.is_paused = false;
             self.play_start = Some(Instant::now());
             self.paused_elapsed = 0.0;
+            self.chapters.clear();
             self.player.play_url(&url).await?;
+            self.fetch_chapters_for(&url);
             self.update_media_controls();
         }
         Ok(())
@@ -474,7 +612,9 @@ impl App {
             self.is_paused = false;
             self.play_start = Some(Instant::now());
             self.paused_elapsed = 0.0;
+            self.chapters.clear();
             self.player.play_url(&url).await?;
+            self.fetch_chapters_for(&url);
             self.update_media_controls();
         }
         Ok(())
@@ -482,6 +622,19 @@ impl App {
 
     async fn queue_selected(&mut self) -> Result<()> {
         if let Some(result) = self.search_results.get(self.selected_index).cloned() {
+            if result.is_playlist {
+                let play_immediately = self.now_playing.is_none();
+                let url = result.watch_url();
+                self.status_message = Some(format!("Loading playlist \"{}\"...", &result.title.chars().take(35).collect::<String>()));
+                let tx = self.msg_tx.clone();
+                tokio::spawn(async move {
+                    match crate::youtube::fetch_playlist(&url).await {
+                        Ok(videos) => { let _ = tx.send(AppMessage::PlaylistLoaded { videos, play_immediately }); }
+                        Err(e) => { let _ = tx.send(AppMessage::SearchError(e.to_string())); }
+                    }
+                });
+                return Ok(());
+            }
             if self.now_playing.is_none() {
                 // Nothing playing — start immediately without touching the queue.
                 let url = result.watch_url();
@@ -489,7 +642,9 @@ impl App {
                 self.is_paused = false;
                 self.play_start = Some(Instant::now());
                 self.paused_elapsed = 0.0;
+                self.chapters.clear();
                 self.player.play_url(&url).await?;
+                self.fetch_chapters_for(&url);
                 self.update_media_controls();
             } else {
                 let title = result.title.clone();
@@ -552,13 +707,43 @@ impl App {
         Ok(())
     }
 
-    async fn seek_by(&mut self, delta: f64) -> Result<()> {
-        let new_pos = (self.current_position() + delta).max(0.0);
-        self.paused_elapsed = new_pos;
+    async fn seek_to(&mut self, pos: f64) -> Result<()> {
+        let pos = pos.max(0.0);
+        self.paused_elapsed = pos;
         if !self.is_paused {
             self.play_start = Some(Instant::now());
         }
-        self.player.seek_abs(new_pos).await.ok();
+        self.player.seek_abs(pos).await.ok();
+        Ok(())
+    }
+
+    async fn seek_by(&mut self, delta: f64) -> Result<()> {
+        let new_pos = (self.current_position() + delta).max(0.0);
+        self.seek_to(new_pos).await
+    }
+
+    async fn seek_to_next_chapter(&mut self) -> Result<()> {
+        let pos = self.current_position();
+        if let Some(ch) = self.chapters.iter().find(|c| c.start_time > pos + 0.5) {
+            self.seek_to(ch.start_time).await?;
+        }
+        Ok(())
+    }
+
+    async fn seek_to_prev_chapter(&mut self) -> Result<()> {
+        let pos = self.current_position();
+        let current = self.chapters.iter().filter(|c| c.start_time <= pos).last().cloned();
+        if let Some(ch) = current {
+            if pos - ch.start_time > 3.0 {
+                self.seek_to(ch.start_time).await?;
+            } else {
+                let prev_start = self.chapters.iter()
+                    .filter(|c| c.start_time < ch.start_time)
+                    .last()
+                    .map(|c| c.start_time);
+                self.seek_to(prev_start.unwrap_or(0.0)).await?;
+            }
+        }
         Ok(())
     }
 
