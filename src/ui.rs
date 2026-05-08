@@ -61,8 +61,13 @@ fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::White)
     };
 
-    let cursor = if active { "█" } else { "" };
-    let content = format!("{}{}", app.search_input, cursor);
+    let content = if active {
+        let before: String = app.search_input.chars().take(app.search_cursor).collect();
+        let after: String = app.search_input.chars().skip(app.search_cursor).collect();
+        format!("{}█{}", before, after)
+    } else {
+        app.search_input.clone()
+    };
 
     let widget = Paragraph::new(content).block(
         Block::default()
@@ -100,7 +105,7 @@ fn render_content(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
     render_results(frame, app, chunks[0]);
@@ -208,7 +213,7 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
     let (thumb_area, info_area) = if app.has_image_support {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
             .split(inner);
         (Some(chunks[0]), chunks[1])
     } else {

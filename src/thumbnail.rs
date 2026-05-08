@@ -16,6 +16,5 @@ pub async fn load(video_id: String, url: String, tx: UnboundedSender<AppMessage>
 
 async fn fetch(url: &str) -> Result<DynamicImage> {
     let bytes = reqwest::get(url).await?.bytes().await?;
-    let img = image::load_from_memory(&bytes)?;
-    Ok(img)
+    Ok(image::load_from_memory(&bytes)?)
 }

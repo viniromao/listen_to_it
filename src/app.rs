@@ -91,6 +91,7 @@ pub struct App {
     pub chapters: Vec<Chapter>,
     pub search_query: String,
     pub is_loading_more: bool,
+    pub search_cursor: usize,
 }
 
 impl App {
@@ -132,6 +133,7 @@ impl App {
             chapters: Vec::new(),
             search_query: String::new(),
             is_loading_more: false,
+            search_cursor: 0,
         }
     }
 
@@ -172,10 +174,48 @@ impl App {
                 self.mode = AppMode::Normal;
             }
             KeyCode::Backspace => {
-                self.search_input.pop();
+                if self.search_cursor > 0 {
+                    self.search_cursor -= 1;
+                    let byte_pos = self.search_input.char_indices()
+                        .nth(self.search_cursor)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    self.search_input.remove(byte_pos);
+                }
+            }
+            KeyCode::Delete => {
+                let len = self.search_input.chars().count();
+                if self.search_cursor < len {
+                    let byte_pos = self.search_input.char_indices()
+                        .nth(self.search_cursor)
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    self.search_input.remove(byte_pos);
+                }
+            }
+            KeyCode::Left => {
+                if self.search_cursor > 0 {
+                    self.search_cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if self.search_cursor < self.search_input.chars().count() {
+                    self.search_cursor += 1;
+                }
+            }
+            KeyCode::Home => {
+                self.search_cursor = 0;
+            }
+            KeyCode::End => {
+                self.search_cursor = self.search_input.chars().count();
             }
             KeyCode::Char(c) => {
-                self.search_input.push(c);
+                let byte_pos = self.search_input.char_indices()
+                    .nth(self.search_cursor)
+                    .map(|(i, _)| i)
+                    .unwrap_or(self.search_input.len());
+                self.search_input.insert(byte_pos, c);
+                self.search_cursor += 1;
             }
             _ => {}
         }
@@ -190,6 +230,7 @@ impl App {
             }
             KeyCode::Char('/') | KeyCode::Char('s') => {
                 self.mode = AppMode::Searching;
+                self.search_cursor = self.search_input.chars().count();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.selected_index > 0 {

@@ -26,9 +26,18 @@ impl VideoResult {
     }
 
     pub fn thumbnail_url(&self) -> String {
+        // Upgrade any ytimg.com URL to hqdefault (480×360): large enough for Fit to fill
+        // the cell area height, always exists, and loads fast (~50KB vs ~200KB maxresdefault).
         self.thumbnail
-            .clone()
-            .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{}/mqdefault.jpg", self.id))
+            .as_deref()
+            .and_then(|url| {
+                if url.contains("i.ytimg.com/vi/") {
+                    url.rfind('/').map(|pos| format!("{}/hqdefault.jpg", &url[..pos]))
+                } else {
+                    Some(url.to_string())
+                }
+            })
+            .unwrap_or_else(|| format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", self.id))
     }
 
     pub fn channel_name(&self) -> &str {
