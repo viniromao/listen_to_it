@@ -25,7 +25,8 @@ A terminal-based YouTube music player. Search for any song, browse results with 
 |---|---|---|
 | [Rust](https://rustup.rs) ≥ 1.75 | Build toolchain | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` |
 | [mpv](https://mpv.io) | Audio playback backend | `pacman -S mpv` / `apt install mpv` |
-| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Resolving YouTube stream URLs | `pacman -S yt-dlp` / `pip install yt-dlp` |
+
+> **yt-dlp** is managed automatically — on first run the app downloads the official standalone binary to `~/.cache/listen_to_it/`. No manual installation needed.
 
 ### Audio backend (one of)
 
@@ -105,9 +106,9 @@ The first build will take a minute to compile all dependencies.
 
 ## How it works
 
-1. **Search** — queries YouTube via `rusty_ytdl` and returns the top 10 results
-2. **Stream resolution** — when you play a track, `yt-dlp` resolves the best available audio-only stream URL from YouTube
-3. **Playback** — `mpv` receives the stream URL and plays it directly, communicating with the app through a Unix socket (`/tmp/listen_to_it_mpv.sock`) for pause, seek, and volume control
+1. **Search** — queries YouTube via `yt-dlp` and returns the top 20 results with thumbnails and metadata
+2. **yt-dlp auto-setup** — on first run the app checks for `yt-dlp` in `$PATH`; if absent, downloads the official standalone binary to `~/.cache/listen_to_it/` automatically
+3. **Playback** — `mpv` receives the YouTube URL and resolves the best audio stream via its built-in `yt-dlp` integration, communicating with the app through a Unix socket (`/tmp/listen_to_it_mpv.sock`) for pause, seek, and volume control
 4. **Thumbnails** — downloaded asynchronously and rendered inline using `ratatui-image` if the terminal supports a graphics protocol
 5. **MPRIS2** — `souvlaki` publishes the current track metadata on D-Bus so media keys and widgets (e.g. waybar, playerctl) work normally
 
@@ -120,8 +121,8 @@ The first build will take a minute to compile all dependencies.
 - Test manually: `mpv --no-video "https://www.youtube.com/watch?v=dQw4w9WgXcQ"`
 
 **Search returns no results**
-- Make sure `yt-dlp` is up to date: `yt-dlp -U`
-- YouTube occasionally changes their API; updating yt-dlp usually fixes it
+- Delete the cached binary to force a fresh download: `rm ~/.cache/listen_to_it/yt-dlp`
+- YouTube occasionally changes their API; the next launch will download the latest yt-dlp automatically
 
 **No thumbnail in the preview panel**
 - Thumbnails require a terminal that implements the Kitty graphics protocol or iTerm2 protocol

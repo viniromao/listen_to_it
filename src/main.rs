@@ -17,11 +17,35 @@ mod player;
 mod thumbnail;
 mod ui;
 mod youtube;
+mod ytdlp;
 
 use app::{App, AppMessage, MediaAction};
 
+async fn check_mpv() -> Result<()> {
+    match tokio::process::Command::new("mpv")
+        .arg("--version")
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => Ok(()),
+        _ => {
+            anyhow::bail!(
+                "mpv not found on PATH. Please install it:\n  \
+                 Debian/Ubuntu: sudo apt install mpv\n  \
+                 Arch:          sudo pacman -S mpv\n  \
+                 Fedora:        sudo dnf install mpv\n  \
+                 macOS:         brew install mpv\n  \
+                 Windows:       winget install mpv"
+            )
+        }
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    check_mpv().await?;
+    ytdlp::ensure().await?;
+
     enable_raw_mode()?;
 
     let (picker, has_image_support) = match Picker::from_query_stdio() {

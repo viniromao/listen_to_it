@@ -50,7 +50,7 @@ impl VideoResult {
 
 pub async fn search(query: &str, max_results: usize) -> Result<Vec<VideoResult>> {
     let search_term = format!("ytsearch{}:{}", max_results, query);
-    let output = tokio::process::Command::new("yt-dlp")
+    let output = tokio::process::Command::new(crate::ytdlp::path())
         .args(["-J", "--flat-playlist", "--no-warnings", &search_term])
         .output()
         .await
@@ -73,7 +73,7 @@ pub async fn search(query: &str, max_results: usize) -> Result<Vec<VideoResult>>
 }
 
 pub async fn fetch_playlist(url: &str) -> Result<Vec<VideoResult>> {
-    let output = tokio::process::Command::new("yt-dlp")
+    let output = tokio::process::Command::new(crate::ytdlp::path())
         .args(["-J", "--flat-playlist", "--no-warnings", url])
         .output()
         .await

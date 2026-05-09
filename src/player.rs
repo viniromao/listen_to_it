@@ -80,19 +80,31 @@ struct MpvProcess {
 impl MpvProcess {
     fn spawn(url: &str) -> Result<Self> {
         let _ = std::fs::remove_file(SOCKET_PATH);
-        let child = Command::new("mpv")
-            .args([
-                "--no-video",
-                "--no-terminal",
-                "--quiet",
-                &format!("--input-ipc-server={SOCKET_PATH}"),
-                url,
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to spawn mpv")?;
+        let mut cmd = Command::new("mpv");
+        cmd.args([
+            "--no-video",
+            "--no-terminal",
+            "--quiet",
+            &format!("--input-ipc-server={SOCKET_PATH}"),
+            url,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+        // Make sure mpv's ytdl_hook can find our managed yt-dlp binary.
+        if let Some(parent) = crate::ytdlp::path().parent() {
+            if !parent.as_os_str().is_empty() {
+                let path_var = std::env::var_os("PATH").unwrap_or_default();
+                let mut paths: Vec<_> = std::env::split_paths(&path_var).collect();
+                paths.insert(0, parent.to_path_buf());
+                if let Ok(joined) = std::env::join_paths(&paths) {
+                    cmd.env("PATH", joined);
+                }
+            }
+        }
+
+        let child = cmd.spawn().context("failed to spawn mpv")?;
         Ok(Self { child })
     }
 

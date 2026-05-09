@@ -367,7 +367,7 @@ impl App {
         let tx = self.msg_tx.clone();
         let url = url.to_string();
         tokio::spawn(async move {
-            let output = tokio::process::Command::new("yt-dlp")
+            let output = tokio::process::Command::new(crate::ytdlp::path())
                 .args(["-j", "--no-playlist", "--no-warnings", &url])
                 .output()
                 .await;
