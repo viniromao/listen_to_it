@@ -1,5 +1,10 @@
 # listen_to_it
 
+[![Release](https://github.com/viniromao/listen_to_it/actions/workflows/release.yml/badge.svg)](https://github.com/viniromao/listen_to_it/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Platform: Linux](https://img.shields.io/badge/platform-Linux-blue?logo=linux&logoColor=white)](#dependencies)
+
 A terminal-based YouTube music player. Search for any song, browse results with album art previews, and play audio directly in your terminal — no browser required.
 
 ![screenshot](screenshot.png)
