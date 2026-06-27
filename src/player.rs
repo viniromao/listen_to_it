@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde_json::json;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -123,6 +123,33 @@ fn ipc_send(cmd: serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// Ask mpv for a numeric property (e.g. `time-pos`) over the IPC socket and
+/// return its value. Returns `None` if mpv is unreachable or the property is
+/// currently unavailable (e.g. before playback has actually started).
+fn ipc_query_f64(prop: &str) -> Option<f64> {
+    let stream = UnixStream::connect(SOCKET_PATH).ok()?;
+    // Never block the player loop for long if mpv is unresponsive.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .ok()?;
+
+    let mut writer = &stream;
+    let mut msg = json!({"command": ["get_property", prop], "request_id": 1}).to_string();
+    msg.push('\n');
+    writer.write_all(msg.as_bytes()).ok()?;
+
+    // mpv may interleave async event lines; read until we see our reply.
+    let reader = BufReader::new(&stream);
+    for line in reader.lines() {
+        let line = line.ok()?;
+        let v: serde_json::Value = serde_json::from_str(&line).ok()?;
+        if v.get("request_id").and_then(|r| r.as_i64()) == Some(1) {
+            return v.get("data").and_then(|d| d.as_f64());
+        }
+    }
+    None
+}
+
 fn wait_for_socket(timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
@@ -198,11 +225,15 @@ fn player_thread(rx: mpsc::Receiver<PlayerCmd>, event_tx: UnboundedSender<AppMes
             },
 
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Check if mpv exited naturally (track finished).
+                // Check if mpv exited naturally (track finished); otherwise
+                // pull the real playback position straight from mpv so the UI
+                // counter stays tightly coupled to the stream.
                 if let Some(ref mut m) = mpv {
                     if let Ok(Some(_)) = m.child.try_wait() {
                         mpv = None;
                         let _ = event_tx.send(AppMessage::AudioFinished);
+                    } else if let Some(pos) = ipc_query_f64("time-pos") {
+                        let _ = event_tx.send(AppMessage::Position(pos));
                     }
                 }
             }

@@ -8,6 +8,7 @@ use ratatui::{
     Frame,
 };
 use ratatui_image::{protocol::StatefulProtocol, Resize, StatefulImage};
+use unicode_width::UnicodeWidthStr;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -61,21 +62,22 @@ fn render_search_bar(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::White)
     };
 
-    let content = if active {
-        let before: String = app.search_input.chars().take(app.search_cursor).collect();
-        let after: String = app.search_input.chars().skip(app.search_cursor).collect();
-        format!("{}█{}", before, after)
-    } else {
-        app.search_input.clone()
-    };
-
-    let widget = Paragraph::new(content).block(
+    let widget = Paragraph::new(app.search_input.clone()).block(
         Block::default()
             .title(" Search  [/] focus  [Esc] cancel ")
             .borders(Borders::ALL)
             .border_style(border_style),
     );
     frame.render_widget(widget, area);
+
+    if active {
+        // Place the real terminal cursor over the character at search_cursor so it
+        // blinks natively and sits on top of the text instead of pushing it aside.
+        let before: String = app.search_input.chars().take(app.search_cursor).collect();
+        let cursor_col = UnicodeWidthStr::width(before.as_str()) as u16;
+        // +1 for the left border.
+        frame.set_cursor_position((area.x + 1 + cursor_col, area.y + 1));
+    }
 }
 
 fn render_content(frame: &mut Frame, app: &mut App, area: Rect) {

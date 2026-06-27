@@ -25,6 +25,8 @@ pub enum AppMessage {
     AudioError(String),
     /// mpv process exited naturally (track finished)
     AudioFinished,
+    /// Real playback position (seconds) reported by mpv via IPC
+    Position(f64),
     ChaptersLoaded { url: String, chapters: Vec<Chapter> },
     MoreResults(Vec<VideoResult>),
     PlaylistLoaded { videos: Vec<VideoResult>, play_immediately: bool },
@@ -70,6 +72,9 @@ pub struct App {
     pub volume: i32,
     pub play_start: Option<Instant>,
     pub paused_elapsed: f64,
+    /// While set (and recent), mpv position reports are ignored so a manual
+    /// seek isn't briefly overwritten by a stale pre-seek sample.
+    pub seek_guard: Option<Instant>,
 
     pub thumbnail_protocols: HashMap<String, StatefulProtocol>,
     pub thumbnails_loading: HashSet<String>,
@@ -115,6 +120,7 @@ impl App {
             volume: 100,
             play_start: None,
             paused_elapsed: 0.0,
+            seek_guard: None,
 
             thumbnail_protocols: HashMap::new(),
             thumbnails_loading: HashSet::new(),
@@ -471,6 +477,24 @@ impl App {
                     self.update_media_controls();
                 }
             }
+            AppMessage::Position(pos) => {
+                // Re-anchor the local clock to mpv's real position. This keeps
+                // the counter glued to the stream across pause, seek, and system
+                // suspend, while the Instant extrapolation in current_position()
+                // keeps motion smooth between these ~5 Hz samples.
+                let seeking_recently = self
+                    .seek_guard
+                    .map(|t| t.elapsed() < Duration::from_millis(400))
+                    .unwrap_or(false);
+                if self.now_playing.is_some() && !seeking_recently {
+                    self.paused_elapsed = pos;
+                    self.play_start = if self.is_paused {
+                        None
+                    } else {
+                        Some(Instant::now())
+                    };
+                }
+            }
             AppMessage::ChaptersLoaded { url, chapters } => {
                 if self.now_playing.as_ref().map(|t| t.watch_url()) == Some(url) {
                     self.chapters = chapters;
@@ -751,6 +775,7 @@ impl App {
     async fn seek_to(&mut self, pos: f64) -> Result<()> {
         let pos = pos.max(0.0);
         self.paused_elapsed = pos;
+        self.seek_guard = Some(Instant::now());
         if !self.is_paused {
             self.play_start = Some(Instant::now());
         }
@@ -798,6 +823,7 @@ impl App {
         let ratio = (col - area.x) as f64 / area.width as f64;
         let target = (ratio * duration).max(0.0);
         self.paused_elapsed = target;
+        self.seek_guard = Some(Instant::now());
         if !self.is_paused {
             self.play_start = Some(Instant::now());
         }
