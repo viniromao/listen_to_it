@@ -30,6 +30,8 @@ pub enum AppMessage {
     ChaptersLoaded { url: String, chapters: Vec<Chapter> },
     MoreResults(Vec<VideoResult>),
     PlaylistLoaded { videos: Vec<VideoResult>, play_immediately: bool },
+    /// Lazily-fetched metadata for a playlist search row.
+    PlaylistMetaLoaded { id: String, meta: crate::youtube::PlaylistMeta },
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +81,8 @@ pub struct App {
     pub thumbnail_protocols: HashMap<String, StatefulProtocol>,
     pub thumbnails_loading: HashSet<String>,
     pub thumbnails_failed: HashSet<String>,
+    /// Playlist ids whose metadata has already been requested, to fetch once.
+    pub playlist_meta_requested: HashSet<String>,
     pub picker: Picker,
 
     pub msg_tx: UnboundedSender<AppMessage>,
@@ -125,6 +129,7 @@ impl App {
             thumbnail_protocols: HashMap::new(),
             thumbnails_loading: HashSet::new(),
             thumbnails_failed: HashSet::new(),
+            playlist_meta_requested: HashSet::new(),
             picker,
 
             msg_tx,
@@ -317,6 +322,7 @@ impl App {
         self.thumbnail_protocols.clear();
         self.thumbnails_loading.clear();
         self.thumbnails_failed.clear();
+        self.playlist_meta_requested.clear();
 
         self.search_query = self.search_input.clone();
         let query = self.search_query.clone();
@@ -348,6 +354,26 @@ impl App {
         tokio::spawn(async move {
             crate::thumbnail::load(vid, url, tx).await;
         });
+    }
+
+    /// Kick off a one-time metadata fetch for every playlist row in the current
+    /// results that hasn't been requested yet (owner, track count, total views).
+    fn request_playlist_meta(&mut self) {
+        let pending: Vec<(String, String)> = self
+            .search_results
+            .iter()
+            .filter(|r| r.is_playlist && !self.playlist_meta_requested.contains(&r.id))
+            .map(|r| (r.id.clone(), r.watch_url()))
+            .collect();
+        for (id, url) in pending {
+            self.playlist_meta_requested.insert(id.clone());
+            let tx = self.msg_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(meta) = crate::youtube::fetch_playlist_meta(&url).await {
+                    let _ = tx.send(AppMessage::PlaylistMetaLoaded { id, meta });
+                }
+            });
+        }
     }
 
     fn request_selected_thumbnail(&mut self) {
@@ -419,6 +445,7 @@ impl App {
                 for (id, url) in preload {
                     self.request_thumbnail_for(&id, &url);
                 }
+                self.request_playlist_meta();
             }
             AppMessage::SearchError(e) => {
                 self.is_searching = false;
@@ -543,6 +570,18 @@ impl App {
                     .filter(|r| !existing.contains(&r.id))
                     .collect();
                 self.search_results.extend(new_results);
+                self.request_playlist_meta();
+            }
+            AppMessage::PlaylistMetaLoaded { id, meta } => {
+                if let Some(r) = self.search_results.iter_mut().find(|r| r.id == id) {
+                    if meta.channel.is_some() {
+                        r.channel = meta.channel;
+                    }
+                    r.playlist_count = meta.count;
+                    if meta.view_count.is_some() {
+                        r.view_count = meta.view_count;
+                    }
+                }
             }
         }
         Ok(())

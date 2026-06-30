@@ -12,6 +12,15 @@ pub struct VideoResult {
     pub uploader: Option<String>,
     pub thumbnail: Option<String>,
     pub is_playlist: bool,
+    /// Number of videos in the playlist, filled in lazily for playlist results.
+    pub playlist_count: Option<u64>,
+}
+
+/// Playlist-level metadata fetched lazily to flesh out a playlist search row.
+pub struct PlaylistMeta {
+    pub channel: Option<String>,
+    pub count: Option<u64>,
+    pub view_count: Option<u64>,
 }
 
 impl VideoResult {
@@ -49,9 +58,23 @@ impl VideoResult {
 }
 
 pub async fn search(query: &str, max_results: usize) -> Result<Vec<VideoResult>> {
-    let search_term = format!("ytsearch{}:{}", max_results, query);
+    // Hit YouTube's regular results page rather than the `ytsearch:` prefix.
+    // `ytsearch:` only ever returns videos; the results page returns videos
+    // and playlists interleaved in YouTube's own ranking order, so playlists
+    // show up exactly where YouTube places them instead of being pinned.
+    let url = format!(
+        "https://www.youtube.com/results?search_query={}",
+        percent_encode(query)
+    );
     let output = tokio::process::Command::new(crate::ytdlp::path())
-        .args(["-J", "--flat-playlist", "--no-warnings", &search_term])
+        .args([
+            "-J",
+            "--flat-playlist",
+            "--no-warnings",
+            "--playlist-end",
+            &max_results.to_string(),
+            &url,
+        ])
         .output()
         .await
         .context("failed to run yt-dlp")?;
@@ -70,6 +93,20 @@ pub async fn search(query: &str, max_results: usize) -> Result<Vec<VideoResult>>
         .as_array()
         .map(|entries| entries.iter().filter_map(parse_entry).collect())
         .unwrap_or_default())
+}
+
+/// Minimal percent-encoding for a YouTube search query string.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 pub async fn fetch_playlist(url: &str) -> Result<Vec<VideoResult>> {
@@ -119,6 +156,7 @@ pub async fn fetch_playlist(url: &str) -> Result<Vec<VideoResult>> {
                         uploader: None,
                         thumbnail: e["thumbnail"].as_str().map(|s| s.to_string()),
                         is_playlist: false,
+                        playlist_count: None,
                     })
                 })
                 .collect()
@@ -128,25 +166,38 @@ pub async fn fetch_playlist(url: &str) -> Result<Vec<VideoResult>> {
 
 fn parse_entry(e: &Value) -> Option<VideoResult> {
     let ie_key = e["ie_key"].as_str().unwrap_or("");
-    // Accept videos and playlists; skip channels and other types
-    if !ie_key.is_empty() && ie_key != "Youtube" && ie_key != "YoutubePlaylist" {
-        return None;
-    }
-    let is_playlist = ie_key == "YoutubePlaylist";
-
-    let id = e["id"].as_str()?.to_string();
-    let title = e["title"].as_str().unwrap_or("Unknown").to_string();
     let url = e["url"]
         .as_str()
         .or_else(|| e["webpage_url"].as_str())
         .map(|s| s.to_string());
+
+    // The results page mixes videos, playlists, channels and "mixes". Videos
+    // come as "Youtube"; everything else comes as "YoutubeTab"/"YoutubePlaylist".
+    // A tab entry is a playlist only when its URL carries a `list=` id —
+    // channels share the same ie_key but link to /channel/ or /@handle, so
+    // they're dropped.
+    let is_playlist = match ie_key {
+        "Youtube" | "" => false,
+        "YoutubePlaylist" => true,
+        "YoutubeTab" => url.as_deref().is_some_and(|u| u.contains("list=")),
+        _ => return None,
+    };
+    if ie_key == "YoutubeTab" && !is_playlist {
+        return None; // a channel, not a playlist
+    }
+
+    let id = e["id"].as_str()?.to_string();
+    let title = e["title"].as_str().unwrap_or("Unknown").to_string();
     let channel = e["channel"]
         .as_str()
         .or_else(|| e["uploader"].as_str())
         .map(|s| s.to_string());
     let duration = e["duration"].as_f64();
     let view_count = e["view_count"].as_u64();
-    let thumbnail = e["thumbnail"].as_str().map(|s| s.to_string());
+    let thumbnail = e["thumbnail"]
+        .as_str()
+        .or_else(|| e["thumbnails"][0]["url"].as_str())
+        .map(|s| s.to_string());
 
     Some(VideoResult {
         id,
@@ -158,5 +209,42 @@ fn parse_entry(e: &Value) -> Option<VideoResult> {
         uploader: None,
         thumbnail,
         is_playlist,
+        playlist_count: None,
+    })
+}
+
+/// Fetch playlist-level metadata (owner, track count, total views) with a cheap
+/// single-item flat request, used to flesh out a playlist row after it appears.
+pub async fn fetch_playlist_meta(url: &str) -> Result<PlaylistMeta> {
+    let output = tokio::process::Command::new(crate::ytdlp::path())
+        .args([
+            "-J",
+            "--flat-playlist",
+            "--no-warnings",
+            "--playlist-items",
+            "1",
+            url,
+        ])
+        .output()
+        .await
+        .context("failed to run yt-dlp")?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "yt-dlp playlist meta failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let json: Value =
+        serde_json::from_slice(&output.stdout).context("failed to parse yt-dlp output")?;
+
+    Ok(PlaylistMeta {
+        channel: json["channel"]
+            .as_str()
+            .or_else(|| json["uploader"].as_str())
+            .map(|s| s.to_string()),
+        count: json["playlist_count"].as_u64(),
+        view_count: json["view_count"].as_u64(),
     })
 }

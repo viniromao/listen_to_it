@@ -143,7 +143,7 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
             };
 
             let num = format!("{:2}. ", i + 1);
-            let title = truncate(&r.title, 36);
+            let title = truncate(&r.title, if r.is_playlist { 26 } else { 36 });
             let channel = r.channel_name();
             let dur = r.duration.map(|d| fmt_duration(d as u64)).unwrap_or_default();
             let views = r.view_count.map(fmt_views).unwrap_or_default();
@@ -158,6 +158,11 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                     Style::default().fg(Color::Yellow),
                 )
+            } else if r.is_playlist {
+                (
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Magenta),
+                )
             } else {
                 (
                     Style::default().add_modifier(Modifier::BOLD),
@@ -165,14 +170,37 @@ fn render_results(frame: &mut Frame, app: &App, area: Rect) {
                 )
             };
 
-            let title_line = Line::from(vec![
+            let thumb_color = if r.is_playlist { Color::Magenta } else { Color::Blue };
+            let mut title_spans = vec![
                 Span::styled(play_icon, play_icon_style),
-                Span::styled(thumb_icon, Style::default().fg(Color::Blue)),
+                Span::styled(thumb_icon, Style::default().fg(thumb_color)),
                 Span::raw(num),
                 Span::styled(title, title_style),
-            ]);
+            ];
+            if r.is_playlist {
+                title_spans.push(Span::styled(
+                    " [PLAYLIST]",
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                ));
+            }
+            let title_line = Line::from(title_spans);
+
+            let info_text = if r.is_playlist {
+                let owner = if r.channel.is_some() { channel } else { "…" };
+                let tracks = r
+                    .playlist_count
+                    .map(|n| format!("{} tracks", n))
+                    .unwrap_or_else(|| "playlist".to_string());
+                if views.is_empty() {
+                    format!("         {} . {}", owner, tracks)
+                } else {
+                    format!("         {} . {} . {} views", owner, tracks, views)
+                }
+            } else {
+                format!("         {} . {} . {}", channel, dur, views)
+            };
             let info_line = Line::from(Span::styled(
-                format!("         {} . {} . {}", channel, dur, views),
+                info_text,
                 Style::default().fg(Color::DarkGray),
             ));
 
@@ -252,26 +280,51 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(fmt_views)
         .unwrap_or_else(|| "Unknown".to_string());
 
-    let info = vec![
+    let mut info = vec![
         Line::from(Span::styled(
             truncate(&result.title, 38),
             Style::default().add_modifier(Modifier::BOLD).fg(Color::White),
         )),
-        Line::from(vec![
+    ];
+    if result.is_playlist {
+        info.push(Line::from(Span::styled(
+            "[PLAYLIST]",
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        )));
+        let owner = if result.channel.is_some() { channel } else { "Loading…".to_string() };
+        info.push(Line::from(vec![
+            Span::styled("Channel:  ", Style::default().fg(Color::Cyan)),
+            Span::raw(owner),
+        ]));
+        info.push(Line::from(vec![
+            Span::styled("Tracks:   ", Style::default().fg(Color::Cyan)),
+            Span::raw(result.playlist_count.map(|n| n.to_string()).unwrap_or_else(|| "…".to_string())),
+        ]));
+        info.push(Line::from(vec![
+            Span::styled("Views:    ", Style::default().fg(Color::Cyan)),
+            Span::raw(if views == "Unknown" { "…".to_string() } else { views }),
+        ]));
+        info.push(Line::from(""));
+        info.push(Line::from(Span::styled("[Enter] Play all (clear queue)", Style::default().fg(Color::Green))));
+        info.push(Line::from(Span::styled("[f]     Queue all tracks",      Style::default().fg(Color::Yellow))));
+    } else {
+        info.push(Line::from(vec![
             Span::styled("Channel:  ", Style::default().fg(Color::Cyan)),
             Span::raw(channel),
-        ]),
-        Line::from(vec![
+        ]));
+        info.push(Line::from(vec![
             Span::styled("Duration: ", Style::default().fg(Color::Cyan)),
             Span::raw(duration),
-        ]),
-        Line::from(vec![
+        ]));
+        info.push(Line::from(vec![
             Span::styled("Views:    ", Style::default().fg(Color::Cyan)),
             Span::raw(views),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled("[Enter] Play now (clear queue)", Style::default().fg(Color::Green))),
-        Line::from(Span::styled("[f]     Add to queue",           Style::default().fg(Color::Yellow))),
+        ]));
+        info.push(Line::from(""));
+        info.push(Line::from(Span::styled("[Enter] Play now (clear queue)", Style::default().fg(Color::Green))));
+        info.push(Line::from(Span::styled("[f]     Add to queue",           Style::default().fg(Color::Yellow))));
+    }
+    info.extend(vec![
         Line::from(""),
         Line::from(Span::styled("[Space] Pause / resume",         Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("[h/l]   Seek -/+5s",             Style::default().fg(Color::DarkGray))),
@@ -281,7 +334,7 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(Span::styled("[r]     Toggle loop",            Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("[d]     Toggle thumbnails",      Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("[q]     Quit",                   Style::default().fg(Color::DarkGray))),
-    ];
+    ]);
 
     let p = Paragraph::new(info).wrap(Wrap { trim: true });
     frame.render_widget(p, info_area);
@@ -294,17 +347,22 @@ fn render_queue(frame: &mut Frame, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, v)| {
             let dur = v.duration.map(|d| fmt_duration(d as u64)).unwrap_or_default();
-            let channel = v.channel_name().to_string();
+            // Playlist imports come back without channel info; omit it rather
+            // than printing a meaningless "Unknown".
+            let channel = v.channel.as_deref().or(v.uploader.as_deref());
+            let meta = match (channel, dur.is_empty()) {
+                (Some(c), false) => format!("  {} · {}", c, dur),
+                (Some(c), true) => format!("  {}", c),
+                (None, false) => format!("  {}", dur),
+                (None, true) => String::new(),
+            };
             let line = Line::from(vec![
                 Span::styled(
                     format!("{:2}. ", i + 1),
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::styled(truncate(&v.title, 50), Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("  {} · {}", channel, dur),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(meta, Style::default().fg(Color::DarkGray)),
             ]);
             ListItem::new(line)
         })
