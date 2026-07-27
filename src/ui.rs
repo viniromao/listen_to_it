@@ -33,21 +33,21 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .constraints([
             Constraint::Length(3),               // search bar
             Constraint::Min(0),                  // content
+            Constraint::Length(status_height),   // now playing
             Constraint::Length(queue_height),    // queue panel
             Constraint::Length(progress_height), // progress bar
-            Constraint::Length(status_height),   // status bar
         ])
         .split(area);
 
     render_search_bar(frame, app, chunks[0]);
     render_content(frame, app, chunks[1]);
+    render_status_bar(frame, app, chunks[2]);
     if queue_height > 0 {
-        render_queue(frame, app, chunks[2]);
+        render_queue(frame, app, chunks[3]);
     }
     if progress_height > 0 {
-        render_progress(frame, app, chunks[3]);
+        render_progress(frame, app, chunks[4]);
     }
-    render_status_bar(frame, app, chunks[4]);
 
     if app.mode == AppMode::Confirming {
         render_confirm_dialog(frame, app, area);
