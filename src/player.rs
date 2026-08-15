@@ -4,6 +4,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -75,6 +76,27 @@ impl Drop for Player {
 
 struct MpvProcess {
     child: Child,
+    /// Most useful line mpv logged (stdout or stderr) for this run, kept
+    /// updated by background reader threads so a failure can be reported
+    /// with a real reason instead of just an exit code. Locks onto the first
+    /// line naming an actual error rather than always tracking the very last
+    /// line, since mpv's final housekeeping message (e.g. "Exiting... (Errors
+    /// when loading file)") is generic and would otherwise clobber it.
+    ///
+    /// Note: `--no-terminal` doesn't just hide the interactive status line —
+    /// it silences mpv's logging entirely (verified empirically: with it set,
+    /// a failing URL exits non-zero with *nothing* on stdout or stderr). So
+    /// terminal mode is left enabled here; that's safe because stdin/stdout
+    /// are redirected away from our real tty (Stdio::null / Stdio::piped),
+    /// so mpv sees a non-terminal and never tries to take over the console.
+    /// What log output there is lands on stdout, not stderr.
+    last_output: Arc<Mutex<LastOutput>>,
+}
+
+#[derive(Default)]
+struct LastOutput {
+    text: String,
+    is_specific: bool,
 }
 
 impl MpvProcess {
@@ -83,14 +105,13 @@ impl MpvProcess {
         let mut cmd = Command::new("mpv");
         cmd.args([
             "--no-video",
-            "--no-terminal",
             "--quiet",
             &format!("--input-ipc-server={SOCKET_PATH}"),
             url,
         ])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
         // Make sure mpv's ytdl_hook can find our managed yt-dlp binary.
         if let Some(parent) = crate::ytdlp::path().parent() {
@@ -104,8 +125,43 @@ impl MpvProcess {
             }
         }
 
-        let child = cmd.spawn().context("failed to spawn mpv")?;
-        Ok(Self { child })
+        let mut child = cmd.spawn().context("failed to spawn mpv")?;
+        let last_output = Arc::new(Mutex::new(LastOutput::default()));
+        for stream in [
+            child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+            child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let last_output = last_output.clone();
+            std::thread::Builder::new()
+                .name("mpv-log".into())
+                .spawn(move || {
+                    for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if let Ok(mut guard) = last_output.lock() {
+                            // Once a line that actually names the problem shows up
+                            // (e.g. the ytdl_hook "ERROR: ..." line), lock it in —
+                            // don't let mpv's generic housekeeping lines that follow
+                            // ("youtube-dl failed: unexpected error occurred",
+                            // "Exiting... (Errors when loading file)") overwrite it
+                            // with something less specific.
+                            if !guard.is_specific {
+                                if trimmed.contains("ERROR") {
+                                    guard.is_specific = true;
+                                }
+                                guard.text = trimmed.to_string();
+                            }
+                        }
+                    }
+                })
+                .expect("failed to spawn mpv-log reader thread");
+        }
+        Ok(Self { child, last_output })
     }
 
     fn kill(&mut self) {
@@ -169,6 +225,7 @@ fn player_thread(rx: mpsc::Receiver<PlayerCmd>, event_tx: UnboundedSender<AppMes
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(cmd) => match cmd {
                 PlayerCmd::Play(url) => {
+                    crate::logline!("player: Play({url})");
                     // Kill previous instance — set mpv to None first so the
                     // polling branch never fires AudioFinished for the old process.
                     if let Some(mut m) = mpv.take() {
@@ -179,16 +236,22 @@ fn player_thread(rx: mpsc::Receiver<PlayerCmd>, event_tx: UnboundedSender<AppMes
 
                     match MpvProcess::spawn(&url) {
                         Err(e) => {
+                            crate::logline!("player: mpv spawn failed: {e}");
                             let _ = event_tx.send(AppMessage::AudioError(e.to_string()));
                         }
                         Ok(mut proc) => {
                             if wait_for_socket(Duration::from_secs(5)) {
+                                crate::logline!("player: mpv ready (pid {})", proc.child.id());
                                 let _ = ipc_send(json!({
                                     "command": ["set_property", "volume", volume]
                                 }));
                                 let _ = event_tx.send(AppMessage::AudioReady);
                                 mpv = Some(proc);
                             } else {
+                                crate::logline!(
+                                    "player: mpv socket timeout (pid {})",
+                                    proc.child.id()
+                                );
                                 proc.kill();
                                 let _ = event_tx
                                     .send(AppMessage::AudioError("mpv socket timeout".to_string()));
@@ -225,15 +288,39 @@ fn player_thread(rx: mpsc::Receiver<PlayerCmd>, event_tx: UnboundedSender<AppMes
             },
 
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Check if mpv exited naturally (track finished); otherwise
-                // pull the real playback position straight from mpv so the UI
-                // counter stays tightly coupled to the stream.
+                // Check if mpv exited; otherwise pull the real playback
+                // position straight from mpv so the UI counter stays tightly
+                // coupled to the stream.
                 if let Some(ref mut m) = mpv {
-                    if let Ok(Some(_)) = m.child.try_wait() {
-                        mpv = None;
-                        let _ = event_tx.send(AppMessage::AudioFinished);
-                    } else if let Some(pos) = ipc_query_f64("time-pos") {
-                        let _ = event_tx.send(AppMessage::Position(pos));
+                    let wait_result = m.child.try_wait();
+                    let last_output = m.last_output.clone();
+                    match wait_result {
+                        Ok(Some(status)) => {
+                            mpv = None;
+                            if status.success() {
+                                crate::logline!("player: mpv exited cleanly ({status}) -> AudioFinished");
+                                let _ = event_tx.send(AppMessage::AudioFinished);
+                            } else {
+                                // mpv bailed early — e.g. yt-dlp couldn't resolve
+                                // the stream (rate limit, unavailable video,
+                                // network blip). Report it instead of silently
+                                // acting as if the track had finished playing.
+                                let detail = last_output.lock().ok().map(|s| s.text.clone()).unwrap_or_default();
+                                let msg = if detail.is_empty() {
+                                    format!("mpv exited unexpectedly ({status})")
+                                } else {
+                                    detail
+                                };
+                                crate::logline!("player: mpv exited with {status} -> AudioError: {msg}");
+                                let _ = event_tx.send(AppMessage::AudioError(msg));
+                            }
+                        }
+                        Ok(None) => {
+                            if let Some(pos) = ipc_query_f64("time-pos") {
+                                let _ = event_tx.send(AppMessage::Position(pos));
+                            }
+                        }
+                        Err(_) => {}
                     }
                 }
             }

@@ -101,7 +101,40 @@ pub struct App {
     pub search_query: String,
     pub is_loading_more: bool,
     pub search_cursor: usize,
+
+    /// Stable clock used only to drive ASCII animation frames (buffering
+    /// spinner, playing equalizer) — never reset, just sampled for elapsed time.
+    pub started_at: Instant,
+
+    /// Consecutive playback failures without a real position report in
+    /// between. Caps the auto-skip-on-error cascade so a systemic failure
+    /// (e.g. YouTube throttling every track) can't silently drain the whole
+    /// queue — see `MAX_CONSECUTIVE_FAILURES`.
+    pub consecutive_failures: u32,
+
+    /// How many times the current track has already been retried after an
+    /// `AudioError`. YouTube's signed CDN URLs are prone to a transient
+    /// 403 that has nothing to do with the video — measured empirically at
+    /// roughly a 1-in-3 failure rate per attempt on an otherwise-fine video,
+    /// so a single retry alone (~11% chance both attempts miss) still
+    /// leaves a real dent — see `MAX_RETRIES_PER_TRACK`. Only counts as a
+    /// real failure, and advances to the next track, once retries are used up.
+    pub retries_current_track: u32,
 }
+
+/// After this many playback failures in a row, stop auto-advancing and leave
+/// the remaining queue intact instead of racing through it.
+const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+/// How many times to retry the same track after an `AudioError` before
+/// giving up on it. Measured per-attempt failure rate on a known-good video
+/// was ~1-in-3, so 2 retries (3 attempts total) drops the odds of every
+/// attempt missing to roughly 1-in-27.
+const MAX_RETRIES_PER_TRACK: u32 = 2;
+
+/// Pause before retrying the same track, giving whatever transient condition
+/// caused the failure (signed-URL race, brief CDN hiccup) a moment to clear.
+const RETRY_DELAY: Duration = Duration::from_millis(500);
 
 impl App {
     pub fn new(msg_tx: UnboundedSender<AppMessage>, picker: Picker, has_image_support: bool) -> Self {
@@ -145,7 +178,19 @@ impl App {
             search_query: String::new(),
             is_loading_more: false,
             search_cursor: 0,
+
+            started_at: Instant::now(),
+            consecutive_failures: 0,
+            retries_current_track: 0,
         }
+    }
+
+    /// True once a track has been requested but mpv hasn't reported a real
+    /// playback position yet (still resolving/buffering the YouTube stream).
+    /// Derived rather than stored so it can never drift out of sync with
+    /// `play_start`/`is_paused`.
+    pub fn is_buffering(&self) -> bool {
+        self.now_playing.is_some() && self.play_start.is_none() && !self.is_paused
     }
 
     /// Returns true when the app should quit.
@@ -467,10 +512,76 @@ impl App {
                 self.status_message = None;
             }
             AppMessage::AudioError(e) => {
-                self.status_message = Some(format!("Audio error: {}", e));
-                self.now_playing = None;
+                let failed_track = self.now_playing.take();
                 self.is_paused = false;
                 self.play_start = None;
+                self.chapters.clear();
+
+                // YouTube's signed CDN URLs are prone to a transient 403 that
+                // has nothing to do with the video itself — the very same URL
+                // can fail once and succeed moments later. Give the same
+                // track a couple of fresh attempts (new extraction, new
+                // signed URL each time) before treating this as a real
+                // failure and burning a consecutive-failure slot / advancing
+                // the queue. A short pause before retrying gives whatever
+                // transient condition caused the 403 a moment to clear
+                // instead of immediately racing into the same failure.
+                if self.retries_current_track < MAX_RETRIES_PER_TRACK {
+                    if let Some(track) = failed_track {
+                        self.retries_current_track += 1;
+                        self.status_message = Some(format!(
+                            "Audio error: {e} — retrying ({}/{MAX_RETRIES_PER_TRACK})",
+                            self.retries_current_track
+                        ));
+                        crate::logline!(
+                            "app: retrying \"{}\" after error (attempt {}/{MAX_RETRIES_PER_TRACK}): {e}",
+                            track.title,
+                            self.retries_current_track
+                        );
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        let url = track.watch_url();
+                        self.now_playing = Some(track);
+                        self.paused_elapsed = 0.0;
+                        self.player.play_url(&url).await?;
+                        self.fetch_chapters_for(&url);
+                        self.update_media_controls();
+                        return Ok(());
+                    }
+                }
+                self.retries_current_track = 0;
+
+                self.consecutive_failures += 1;
+                crate::logline!(
+                    "app: AudioError #{} (after {MAX_RETRIES_PER_TRACK} retries): {e} ({} left in queue)",
+                    self.consecutive_failures,
+                    self.queue.len()
+                );
+                if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    // Several tracks in a row failed to play even after a
+                    // retry each — this is almost certainly a systemic
+                    // problem (network, rate limiting, broken yt-dlp), not
+                    // one-off bad luck. Stop racing through the queue and
+                    // surface it clearly instead of silently draining every
+                    // track down to an empty queue.
+                    self.status_message = Some(format!(
+                        "Audio error: {e} — {} tracks failed in a row, stopped auto-skip ({} left in queue)",
+                        self.consecutive_failures,
+                        self.queue.len()
+                    ));
+                    crate::logline!("app: hit MAX_CONSECUTIVE_FAILURES, stopping auto-skip");
+                } else {
+                    self.status_message = Some(format!("Audio error: {e} — skipping to next"));
+                    // The track never actually played, so it doesn't belong in
+                    // history — just drop it and, if there's more queued, move on
+                    // rather than leaving playback silently stalled.
+                    if let Some(next) = self.queue.pop_front() {
+                        let url = next.watch_url();
+                        self.now_playing = Some(next);
+                        self.paused_elapsed = 0.0;
+                        self.player.play_url(&url).await?;
+                        self.fetch_chapters_for(&url);
+                    }
+                }
                 self.update_media_controls();
             }
             AppMessage::AudioFinished => {
@@ -478,7 +589,7 @@ impl App {
                     if let Some(ref track) = self.now_playing {
                         let url = track.watch_url();
                         self.is_paused = false;
-                        self.play_start = Some(Instant::now());
+                        self.play_start = None; // anchored once mpv reports a real Position
                         self.paused_elapsed = 0.0;
                         self.player.play_url(&url).await?;
                         self.update_media_controls();
@@ -491,7 +602,7 @@ impl App {
                         let url = next.watch_url();
                         self.now_playing = Some(next);
                         self.is_paused = false;
-                        self.play_start = Some(Instant::now());
+                        self.play_start = None; // anchored once mpv reports a real Position
                         self.paused_elapsed = 0.0;
                         self.chapters.clear();
                         self.player.play_url(&url).await?;
@@ -514,6 +625,8 @@ impl App {
                     .map(|t| t.elapsed() < Duration::from_millis(400))
                     .unwrap_or(false);
                 if self.now_playing.is_some() && !seeking_recently {
+                    self.consecutive_failures = 0;
+                    self.retries_current_track = 0;
                     self.paused_elapsed = pos;
                     self.play_start = if self.is_paused {
                         None
@@ -544,9 +657,11 @@ impl App {
                         let url = first.watch_url();
                         self.now_playing = Some(first);
                         self.is_paused = false;
-                        self.play_start = Some(Instant::now());
+                        self.play_start = None; // anchored once mpv reports a real Position
                         self.paused_elapsed = 0.0;
                         self.chapters.clear();
+                        self.consecutive_failures = 0;
+                        self.retries_current_track = 0;
                         self.player.play_url(&url).await?;
                         self.fetch_chapters_for(&url);
                     }
@@ -678,9 +793,11 @@ impl App {
             let url = result.watch_url();
             self.now_playing = Some(result);
             self.is_paused = false;
-            self.play_start = Some(Instant::now());
+            self.play_start = None; // anchored once mpv reports a real Position
             self.paused_elapsed = 0.0;
             self.chapters.clear();
+            self.consecutive_failures = 0;
+            self.retries_current_track = 0;
             self.player.play_url(&url).await?;
             self.fetch_chapters_for(&url);
             self.update_media_controls();
@@ -696,9 +813,11 @@ impl App {
             let url = next.watch_url();
             self.now_playing = Some(next);
             self.is_paused = false;
-            self.play_start = Some(Instant::now());
+            self.play_start = None; // anchored once mpv reports a real Position
             self.paused_elapsed = 0.0;
             self.chapters.clear();
+            self.consecutive_failures = 0;
+            self.retries_current_track = 0;
             self.player.play_url(&url).await?;
             self.fetch_chapters_for(&url);
             self.update_media_controls();
@@ -714,9 +833,11 @@ impl App {
             let url = prev.watch_url();
             self.now_playing = Some(prev);
             self.is_paused = false;
-            self.play_start = Some(Instant::now());
+            self.play_start = None; // anchored once mpv reports a real Position
             self.paused_elapsed = 0.0;
             self.chapters.clear();
+            self.consecutive_failures = 0;
+            self.retries_current_track = 0;
             self.player.play_url(&url).await?;
             self.fetch_chapters_for(&url);
             self.update_media_controls();
@@ -744,9 +865,11 @@ impl App {
                 let url = result.watch_url();
                 self.now_playing = Some(result);
                 self.is_paused = false;
-                self.play_start = Some(Instant::now());
+                self.play_start = None; // anchored once mpv reports a real Position
                 self.paused_elapsed = 0.0;
                 self.chapters.clear();
+                self.consecutive_failures = 0;
+                self.retries_current_track = 0;
                 self.player.play_url(&url).await?;
                 self.fetch_chapters_for(&url);
                 self.update_media_controls();
