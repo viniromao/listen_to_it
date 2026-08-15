@@ -377,7 +377,15 @@ fn render_queue(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(list, area);
 }
 
+/// Classic four-frame ASCII spinner, ~120ms per frame.
+const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
+
 fn render_progress(frame: &mut Frame, app: &mut App, area: Rect) {
+    if app.is_buffering() {
+        render_buffering_bar(frame, app, area);
+        return;
+    }
+
     let pos = app.current_position();
     let duration = app.now_playing.as_ref().and_then(|t| t.duration).unwrap_or(0.0);
     let ratio = if duration > 0.0 { (pos / duration).clamp(0.0, 1.0) } else { 0.0 };
@@ -435,11 +443,64 @@ fn render_progress(frame: &mut Frame, app: &mut App, area: Rect) {
     app.progress_bar_area = Some(Rect { width: bar_w as u16, ..area });
 }
 
+/// A "Larson scanner" style bar (like KITT's dashboard light) that sweeps
+/// back and forth while mpv is still resolving/buffering the stream — stands
+/// in for the progress bar until a real position is known.
+fn render_buffering_bar(frame: &mut Frame, app: &mut App, area: Rect) {
+    let label = " buffering... ";
+    let label_w = label.chars().count() as u16;
+    let bar_w = area.width.saturating_sub(label_w) as usize;
+    app.progress_bar_area = None; // nothing to seek into yet
+
+    if bar_w == 0 {
+        return;
+    }
+
+    let t = app.started_at.elapsed().as_millis() as usize;
+    let period = bar_w * 2;
+    let x = (t / 35) % period;
+    let head = if x < bar_w { x } else { period - x - 1 };
+
+    let bar: String = (0..bar_w)
+        .map(|i| match (i as isize - head as isize).unsigned_abs() {
+            0 => '#',
+            1 => '=',
+            2 => '-',
+            _ => '.',
+        })
+        .collect();
+
+    let spans = vec![
+        Span::styled(bar, Style::default().fg(Color::Yellow)),
+        Span::styled(label, Style::default().fg(Color::Yellow)),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default().borders(Borders::ALL);
 
     if let Some(ref track) = app.now_playing {
-        let icon = if app.is_paused { "|| " } else { ">  " };
+        if app.is_buffering() {
+            let t = app.started_at.elapsed().as_millis() as usize;
+            let spinner = SPINNER[(t / 120) % SPINNER.len()];
+            let dots = ".".repeat((t / 300) % 4);
+            let line = Line::from(vec![
+                Span::styled(format!(" {} ", spinner), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::raw("Fetching from YouTube: "),
+                Span::styled(truncate(&track.title, 45), Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(format!("{:<3}", dots)),
+            ]);
+            let p = Paragraph::new(line)
+                .block(block)
+                .style(Style::default().fg(Color::Yellow));
+            frame.render_widget(p, area);
+            return;
+        }
+
+        // Both icons occupy the same width so the title doesn't shift when
+        // playback is paused and resumed.
+        let icon = if app.is_paused { "||  " } else { "▶   " };
         let pos_val = app.current_position();
         let pos = fmt_duration(pos_val as u64);
         let queue_info = if app.queue.is_empty() {
@@ -473,6 +534,11 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         let p = Paragraph::new(lines)
             .block(block)
             .style(Style::default().fg(Color::Green));
+        frame.render_widget(p, area);
+    } else if let Some(ref msg) = app.status_message {
+        let p = Paragraph::new(format!(" {msg}"))
+            .block(block)
+            .style(Style::default().fg(Color::Red));
         frame.render_widget(p, area);
     } else {
         let p = Paragraph::new(" No track playing  |  [/] search  [j/k] navigate  [Enter] play")
