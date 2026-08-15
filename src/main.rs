@@ -13,6 +13,8 @@ use tokio::sync::mpsc;
 use tokio::time::Duration;
 
 mod app;
+#[macro_use]
+mod logging;
 mod player;
 mod thumbnail;
 mod ui;
@@ -43,8 +45,14 @@ async fn check_mpv() -> Result<()> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    match logging::init() {
+        Ok(path) => eprintln!("Logging to {}", path.display()),
+        Err(e) => eprintln!("Could not open debug log: {e}"),
+    }
+
     check_mpv().await?;
     ytdlp::ensure().await?;
+    logline!("using yt-dlp at {}", ytdlp::path().display());
 
     enable_raw_mode()?;
 
