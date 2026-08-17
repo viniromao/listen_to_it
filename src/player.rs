@@ -13,12 +13,20 @@ use crate::app::AppMessage;
 const SOCKET_PATH: &str = "/tmp/listen_to_it_mpv.sock";
 
 enum PlayerCmd {
-    Play(String),
+    Play(PlayRequest),
     TogglePause,
     SetVolume(i32),
     SeekAbs(f64),
     Stop,
     Quit,
+}
+
+/// A media URL that is ready to play, with the request headers it was issued
+/// against. Resolution happens in [`crate::stream`]; by the time it reaches
+/// the player thread there is nothing left to look up.
+struct PlayRequest {
+    url: String,
+    headers: Vec<(String, String)>,
 }
 
 pub struct Player {
@@ -35,8 +43,11 @@ impl Player {
         Self { tx: Some(tx) }
     }
 
-    pub async fn play_url(&self, url: &str) -> Result<()> {
-        self.send(PlayerCmd::Play(url.to_string()));
+    pub async fn play(&self, stream: &crate::stream::Stream) -> Result<()> {
+        self.send(PlayerCmd::Play(PlayRequest {
+            url: stream.media_url.clone(),
+            headers: stream.headers.clone(),
+        }));
         Ok(())
     }
 
@@ -100,30 +111,34 @@ struct LastOutput {
 }
 
 impl MpvProcess {
-    fn spawn(url: &str) -> Result<Self> {
+    fn spawn(req: &PlayRequest) -> Result<Self> {
         let _ = std::fs::remove_file(SOCKET_PATH);
         let mut cmd = Command::new("mpv");
         cmd.args([
             "--no-video",
             "--quiet",
+            // The URL is already a direct media URL — letting ytdl_hook run
+            // would send it back through yt-dlp for nothing, which is exactly
+            // the ~2.5 s of startup latency resolving it ourselves avoids.
+            "--no-ytdl",
             &format!("--input-ipc-server={SOCKET_PATH}"),
-            url,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        ]);
 
-        // Make sure mpv's ytdl_hook can find our managed yt-dlp binary.
-        if let Some(parent) = crate::ytdlp::path().parent() {
-            if !parent.as_os_str().is_empty() {
-                let path_var = std::env::var_os("PATH").unwrap_or_default();
-                let mut paths: Vec<_> = std::env::split_paths(&path_var).collect();
-                paths.insert(0, parent.to_path_buf());
-                if let Ok(joined) = std::env::join_paths(&paths) {
-                    cmd.env("PATH", joined);
-                }
+        // Replay the headers yt-dlp used. The User-Agent has its own option;
+        // the rest go through the list option one at a time, since values can
+        // contain commas and `--http-header-fields` is comma-separated.
+        for (name, value) in &req.headers {
+            if name.eq_ignore_ascii_case("user-agent") {
+                cmd.arg(format!("--user-agent={value}"));
+            } else {
+                cmd.arg(format!("--http-header-fields-append={name}: {value}"));
             }
         }
+
+        cmd.arg(&req.url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         let mut child = cmd.spawn().context("failed to spawn mpv")?;
         let last_output = Arc::new(Mutex::new(LastOutput::default()));
@@ -224,8 +239,8 @@ fn player_thread(rx: mpsc::Receiver<PlayerCmd>, event_tx: UnboundedSender<AppMes
     loop {
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(cmd) => match cmd {
-                PlayerCmd::Play(url) => {
-                    crate::logline!("player: Play({url})");
+                PlayerCmd::Play(req) => {
+                    crate::logline!("player: Play({})", req.url);
                     // Kill previous instance — set mpv to None first so the
                     // polling branch never fires AudioFinished for the old process.
                     if let Some(mut m) = mpv.take() {
@@ -234,7 +249,7 @@ fn player_thread(rx: mpsc::Receiver<PlayerCmd>, event_tx: UnboundedSender<AppMes
 
                     let _ = event_tx.send(AppMessage::AudioLoading);
 
-                    match MpvProcess::spawn(&url) {
+                    match MpvProcess::spawn(&req) {
                         Err(e) => {
                             crate::logline!("player: mpv spawn failed: {e}");
                             let _ = event_tx.send(AppMessage::AudioError(e.to_string()));
@@ -327,5 +342,50 @@ fn player_thread(rx: mpsc::Receiver<PlayerCmd>, event_tx: UnboundedSender<AppMes
 
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// End-to-end through a real mpv: resolve a track, hand the player the
+    /// stream, and check mpv actually opens it and reports positions — which
+    /// is what proves the direct URL, `--no-ytdl` and the replayed request
+    /// headers all hold together. Hits the network, so it's opt-in:
+    /// `cargo test -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "requires network, yt-dlp and mpv"]
+    async fn plays_a_resolved_stream_without_touching_yt_dlp_again() {
+        // Keep the test silent: mpv reads ao=null from a throwaway config dir.
+        let mpv_home = std::env::temp_dir().join("listen_to_it_test_mpv");
+        std::fs::create_dir_all(&mpv_home).unwrap();
+        std::fs::write(mpv_home.join("mpv.conf"), "ao=null\n").unwrap();
+        std::env::set_var("MPV_HOME", &mpv_home);
+
+        crate::ytdlp::ensure().await.unwrap();
+        let stream = crate::stream::resolve("https://www.youtube.com/watch?v=NolF1yCK33c")
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let player = Player::new(tx);
+        player.play(&stream).await.unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut ready = false;
+        let mut position = None;
+        while Instant::now() < deadline && position.is_none() {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(AppMessage::AudioReady)) => ready = true,
+                Ok(Some(AppMessage::Position(p))) if p > 0.0 => position = Some(p),
+                Ok(Some(AppMessage::AudioError(e))) => panic!("playback failed: {e}"),
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(ready, "mpv never came up");
+        assert!(position.is_some(), "mpv never reported a playback position");
     }
 }

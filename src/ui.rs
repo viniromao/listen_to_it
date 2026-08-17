@@ -536,9 +536,13 @@ fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().fg(Color::Green));
         frame.render_widget(p, area);
     } else if let Some(ref msg) = app.status_message {
+        // Red is reserved for things that actually failed. Searching, loading a
+        // playlist or queueing a track are ordinary progress and shouldn't
+        // paint the status bar like a fault.
+        let color = if app.status_is_error { Color::Red } else { Color::Cyan };
         let p = Paragraph::new(format!(" {msg}"))
             .block(block)
-            .style(Style::default().fg(Color::Red));
+            .style(Style::default().fg(color));
         frame.render_widget(p, area);
     } else {
         let p = Paragraph::new(" No track playing  |  [/] search  [j/k] navigate  [Enter] play")

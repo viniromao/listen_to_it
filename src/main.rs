@@ -16,6 +16,7 @@ mod app;
 #[macro_use]
 mod logging;
 mod player;
+mod stream;
 mod thumbnail;
 mod ui;
 mod youtube;

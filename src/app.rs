@@ -9,6 +9,7 @@ use image::DynamicImage;
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use souvlaki::{MediaControls, MediaMetadata, MediaPlayback};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -27,7 +28,14 @@ pub enum AppMessage {
     AudioFinished,
     /// Real playback position (seconds) reported by mpv via IPC
     Position(f64),
-    ChaptersLoaded { url: String, chapters: Vec<Chapter> },
+    /// A track requested for playback has been resolved to a playable stream.
+    StreamReady { watch_url: String, stream: Arc<crate::stream::Stream> },
+    /// Resolving a track requested for playback failed.
+    StreamFailed { watch_url: String, error: String },
+    /// Debounce tick: the highlighted row has stayed put long enough to be
+    /// worth resolving ahead of time. Carries the generation it was scheduled
+    /// with, so ticks from rows the user has already scrolled past are ignored.
+    PrefetchSelected(u64),
     MoreResults(Vec<VideoResult>),
     PlaylistLoaded { videos: Vec<VideoResult>, play_immediately: bool },
     /// Lazily-fetched metadata for a playlist search row.
@@ -65,6 +73,10 @@ pub struct App {
     pub selected_index: usize,
     pub is_searching: bool,
     pub status_message: Option<String>,
+    /// Whether `status_message` reports a failure, as opposed to progress the
+    /// user asked for. Only the former earns an alarming colour — a search in
+    /// flight is not an error. Kept in sync by `set_status`/`set_error`.
+    pub status_is_error: bool,
 
     pub player: Player,
     pub now_playing: Option<VideoResult>,
@@ -120,6 +132,16 @@ pub struct App {
     /// leaves a real dent — see `MAX_RETRIES_PER_TRACK`. Only counts as a
     /// real failure, and advances to the next track, once retries are used up.
     pub retries_current_track: u32,
+
+    /// When the current track was requested, until its first real position
+    /// report. Only used to log how long starting a track actually took, which
+    /// is the number to watch when playback feels slow.
+    track_started_at: Option<Instant>,
+
+    /// Bumped every time the highlighted search row changes. A scheduled
+    /// prefetch tick only acts if its generation is still current, which
+    /// debounces resolving while the user scrolls through results.
+    prefetch_gen: u64,
 }
 
 /// After this many playback failures in a row, stop auto-advancing and leave
@@ -136,6 +158,12 @@ const MAX_RETRIES_PER_TRACK: u32 = 2;
 /// caused the failure (signed-URL race, brief CDN hiccup) a moment to clear.
 const RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// How long a search row must stay highlighted before its stream is resolved
+/// ahead of a possible play. Long enough that scrolling past a row costs
+/// nothing, short enough that a row someone is actually reading is ready by
+/// the time they hit Enter.
+const HOVER_PREFETCH_DELAY: Duration = Duration::from_millis(900);
+
 impl App {
     pub fn new(msg_tx: UnboundedSender<AppMessage>, picker: Picker, has_image_support: bool) -> Self {
         // Player spawns its thread immediately and uses msg_tx to report state back.
@@ -148,6 +176,7 @@ impl App {
             selected_index: 0,
             is_searching: false,
             status_message: None,
+            status_is_error: false,
 
             player,
             now_playing: None,
@@ -182,7 +211,27 @@ impl App {
             started_at: Instant::now(),
             consecutive_failures: 0,
             retries_current_track: 0,
+            track_started_at: None,
+            prefetch_gen: 0,
         }
+    }
+
+    /// Progress the user asked for: searching, loading, queued. Informational,
+    /// and rendered as such.
+    fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_message = Some(msg.into());
+        self.status_is_error = false;
+    }
+
+    /// Something actually went wrong. Rendered as an error.
+    fn set_error(&mut self, msg: impl Into<String>) {
+        self.status_message = Some(msg.into());
+        self.status_is_error = true;
+    }
+
+    fn clear_status(&mut self) {
+        self.status_message = None;
+        self.status_is_error = false;
     }
 
     /// True once a track has been requested but mpv hasn't reported a real
@@ -191,6 +240,78 @@ impl App {
     /// `play_start`/`is_paused`.
     pub fn is_buffering(&self) -> bool {
         self.now_playing.is_some() && self.play_start.is_none() && !self.is_paused
+    }
+
+    /// Make `track` the current track and start it playing.
+    async fn start_track(&mut self, track: VideoResult) -> Result<()> {
+        let url = track.watch_url();
+        self.now_playing = Some(track);
+        self.is_paused = false;
+        self.play_start = None; // anchored once mpv reports a real Position
+        self.paused_elapsed = 0.0;
+        self.chapters.clear();
+        self.retries_current_track = 0;
+        self.track_started_at = Some(Instant::now());
+        self.begin_stream(&url).await?;
+        self.update_media_controls();
+        self.prefetch_next();
+        Ok(())
+    }
+
+    /// Hand the current track's stream to mpv. A stream that was resolved
+    /// ahead of time (see `crate::stream`) starts immediately; otherwise
+    /// resolving runs in the background and playback starts from
+    /// `StreamReady`, so the UI never sits still waiting on yt-dlp.
+    async fn begin_stream(&mut self, watch_url: &str) -> Result<()> {
+        if let Some(stream) = crate::stream::cached(watch_url) {
+            self.chapters = stream.chapters.clone();
+            self.clear_status();
+            self.player.play(&stream).await?;
+            return Ok(());
+        }
+
+        // Nothing cached: stop whatever is playing now rather than leaving the
+        // previous track audible while the UI already shows the new one.
+        self.player.stop().await;
+        self.set_status("Loading stream...".to_string());
+        let tx = self.msg_tx.clone();
+        let watch_url = watch_url.to_string();
+        tokio::spawn(async move {
+            let msg = match crate::stream::resolve(&watch_url).await {
+                Ok(stream) => AppMessage::StreamReady { watch_url, stream },
+                Err(e) => AppMessage::StreamFailed { watch_url, error: e.to_string() },
+            };
+            let _ = tx.send(msg);
+        });
+        Ok(())
+    }
+
+    /// Resolve the next queued track while the current one is still playing,
+    /// so advancing the queue costs an mpv startup instead of a fresh
+    /// extraction.
+    fn prefetch_next(&self) {
+        if let Some(next) = self.queue.front() {
+            if !next.is_playlist {
+                crate::stream::prefetch(next.watch_url());
+            }
+        }
+    }
+
+    /// Selection moved: pull in the artwork for the new row, and line it up to
+    /// be resolved if it stays put.
+    fn on_selection_changed(&mut self) {
+        self.request_selected_thumbnail();
+        self.schedule_selection_prefetch();
+    }
+
+    fn schedule_selection_prefetch(&mut self) {
+        self.prefetch_gen = self.prefetch_gen.wrapping_add(1);
+        let generation = self.prefetch_gen;
+        let tx = self.msg_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(HOVER_PREFETCH_DELAY).await;
+            let _ = tx.send(AppMessage::PrefetchSelected(generation));
+        });
     }
 
     /// Returns true when the app should quit.
@@ -291,7 +412,7 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.selected_index > 0 {
                     self.selected_index -= 1;
-                    self.request_selected_thumbnail();
+                    self.on_selection_changed();
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -299,7 +420,7 @@ impl App {
                     && self.selected_index + 1 < self.search_results.len()
                 {
                     self.selected_index += 1;
-                    self.request_selected_thumbnail();
+                    self.on_selection_changed();
                     let remaining = self.search_results.len().saturating_sub(self.selected_index + 1);
                     if remaining <= 2 && !self.is_loading_more && !self.search_query.is_empty() {
                         self.load_more_results();
@@ -345,7 +466,7 @@ impl App {
             KeyCode::Char('r') => {
                 self.loop_mode = !self.loop_mode;
                 let msg = if self.loop_mode { "Loop ON" } else { "Loop OFF" };
-                self.status_message = Some(msg.to_string());
+                self.set_status(msg.to_string());
             }
             KeyCode::Char('}') => {
                 self.seek_to_next_chapter().await?;
@@ -361,7 +482,7 @@ impl App {
     async fn start_search(&mut self) {
         self.is_searching = true;
         self.is_loading_more = false;
-        self.status_message = Some("Searching...".to_string());
+        self.set_status("Searching...".to_string());
         self.search_results.clear();
         self.selected_index = 0;
         self.thumbnail_protocols.clear();
@@ -440,43 +561,11 @@ impl App {
         });
     }
 
-    fn fetch_chapters_for(&self, url: &str) {
-        let tx = self.msg_tx.clone();
-        let url = url.to_string();
-        tokio::spawn(async move {
-            let output = tokio::process::Command::new(crate::ytdlp::path())
-                .args(["-j", "--no-playlist", "--no-warnings", &url])
-                .output()
-                .await;
-            let chapters = match output {
-                Ok(out) if out.status.success() => {
-                    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
-                        .unwrap_or(serde_json::Value::Null);
-                    json["chapters"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|c| {
-                                    Some(Chapter {
-                                        start_time: c["start_time"].as_f64()?,
-                                        title: c["title"].as_str().unwrap_or("").to_string(),
-                                    })
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                }
-                _ => vec![],
-            };
-            let _ = tx.send(AppMessage::ChaptersLoaded { url, chapters });
-        });
-    }
-
     pub async fn handle_message(&mut self, msg: AppMessage) -> Result<()> {
         match msg {
             AppMessage::SearchResults(results) => {
                 self.is_searching = false;
-                self.status_message = None;
+                self.clear_status();
 
                 let preload: Vec<(String, String)> = results
                     .iter()
@@ -491,10 +580,11 @@ impl App {
                     self.request_thumbnail_for(&id, &url);
                 }
                 self.request_playlist_meta();
+                self.schedule_selection_prefetch();
             }
             AppMessage::SearchError(e) => {
                 self.is_searching = false;
-                self.status_message = Some(format!("Error: {}", e));
+                self.set_error(format!("Error: {}", e));
             }
             AppMessage::ThumbnailLoaded { video_id, image } => {
                 self.thumbnails_loading.remove(&video_id);
@@ -506,113 +596,52 @@ impl App {
                 self.thumbnails_failed.insert(video_id);
             }
             AppMessage::AudioLoading => {
-                self.status_message = Some("Buffering audio...".to_string());
+                self.set_status("Buffering audio...".to_string());
             }
             AppMessage::AudioReady => {
-                self.status_message = None;
+                self.clear_status();
             }
             AppMessage::AudioError(e) => {
-                let failed_track = self.now_playing.take();
-                self.is_paused = false;
-                self.play_start = None;
-                self.chapters.clear();
-
-                // YouTube's signed CDN URLs are prone to a transient 403 that
-                // has nothing to do with the video itself — the very same URL
-                // can fail once and succeed moments later. Give the same
-                // track a couple of fresh attempts (new extraction, new
-                // signed URL each time) before treating this as a real
-                // failure and burning a consecutive-failure slot / advancing
-                // the queue. A short pause before retrying gives whatever
-                // transient condition caused the 403 a moment to clear
-                // instead of immediately racing into the same failure.
-                if self.retries_current_track < MAX_RETRIES_PER_TRACK {
-                    if let Some(track) = failed_track {
-                        self.retries_current_track += 1;
-                        self.status_message = Some(format!(
-                            "Audio error: {e} — retrying ({}/{MAX_RETRIES_PER_TRACK})",
-                            self.retries_current_track
-                        ));
-                        crate::logline!(
-                            "app: retrying \"{}\" after error (attempt {}/{MAX_RETRIES_PER_TRACK}): {e}",
-                            track.title,
-                            self.retries_current_track
-                        );
-                        tokio::time::sleep(RETRY_DELAY).await;
-                        let url = track.watch_url();
-                        self.now_playing = Some(track);
-                        self.paused_elapsed = 0.0;
-                        self.player.play_url(&url).await?;
-                        self.fetch_chapters_for(&url);
-                        self.update_media_controls();
-                        return Ok(());
+                self.on_playback_error(e).await?;
+            }
+            AppMessage::StreamReady { watch_url, stream } => {
+                if self.is_current_track(&watch_url) {
+                    self.chapters = stream.chapters.clone();
+                    self.clear_status();
+                    self.player.play(&stream).await?;
+                }
+            }
+            AppMessage::StreamFailed { watch_url, error } => {
+                if self.is_current_track(&watch_url) {
+                    self.on_playback_error(error).await?;
+                }
+            }
+            AppMessage::PrefetchSelected(generation) => {
+                if generation == self.prefetch_gen {
+                    if let Some(result) = self.search_results.get(self.selected_index) {
+                        if !result.is_playlist {
+                            crate::stream::prefetch(result.watch_url());
+                        }
                     }
                 }
-                self.retries_current_track = 0;
-
-                self.consecutive_failures += 1;
-                crate::logline!(
-                    "app: AudioError #{} (after {MAX_RETRIES_PER_TRACK} retries): {e} ({} left in queue)",
-                    self.consecutive_failures,
-                    self.queue.len()
-                );
-                if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    // Several tracks in a row failed to play even after a
-                    // retry each — this is almost certainly a systemic
-                    // problem (network, rate limiting, broken yt-dlp), not
-                    // one-off bad luck. Stop racing through the queue and
-                    // surface it clearly instead of silently draining every
-                    // track down to an empty queue.
-                    self.status_message = Some(format!(
-                        "Audio error: {e} — {} tracks failed in a row, stopped auto-skip ({} left in queue)",
-                        self.consecutive_failures,
-                        self.queue.len()
-                    ));
-                    crate::logline!("app: hit MAX_CONSECUTIVE_FAILURES, stopping auto-skip");
-                } else {
-                    self.status_message = Some(format!("Audio error: {e} — skipping to next"));
-                    // The track never actually played, so it doesn't belong in
-                    // history — just drop it and, if there's more queued, move on
-                    // rather than leaving playback silently stalled.
-                    if let Some(next) = self.queue.pop_front() {
-                        let url = next.watch_url();
-                        self.now_playing = Some(next);
-                        self.paused_elapsed = 0.0;
-                        self.player.play_url(&url).await?;
-                        self.fetch_chapters_for(&url);
-                    }
-                }
-                self.update_media_controls();
             }
             AppMessage::AudioFinished => {
                 if self.loop_mode {
-                    if let Some(ref track) = self.now_playing {
-                        let url = track.watch_url();
-                        self.is_paused = false;
-                        self.play_start = None; // anchored once mpv reports a real Position
-                        self.paused_elapsed = 0.0;
-                        self.player.play_url(&url).await?;
-                        self.update_media_controls();
+                    if let Some(track) = self.now_playing.take() {
+                        self.start_track(track).await?;
                     }
                 } else {
                     if let Some(done) = self.now_playing.take() {
                         self.history.push(done);
                     }
                     if let Some(next) = self.queue.pop_front() {
-                        let url = next.watch_url();
-                        self.now_playing = Some(next);
-                        self.is_paused = false;
-                        self.play_start = None; // anchored once mpv reports a real Position
-                        self.paused_elapsed = 0.0;
-                        self.chapters.clear();
-                        self.player.play_url(&url).await?;
-                        self.fetch_chapters_for(&url);
+                        self.start_track(next).await?;
                     } else {
                         self.is_paused = false;
                         self.play_start = None;
                         self.chapters.clear();
+                        self.update_media_controls();
                     }
-                    self.update_media_controls();
                 }
             }
             AppMessage::Position(pos) => {
@@ -625,6 +654,12 @@ impl App {
                     .map(|t| t.elapsed() < Duration::from_millis(400))
                     .unwrap_or(false);
                 if self.now_playing.is_some() && !seeking_recently {
+                    if let Some(requested_at) = self.track_started_at.take() {
+                        crate::logline!(
+                            "app: audio started {:.2}s after the track was requested",
+                            requested_at.elapsed().as_secs_f64()
+                        );
+                    }
                     self.consecutive_failures = 0;
                     self.retries_current_track = 0;
                     self.paused_elapsed = pos;
@@ -635,15 +670,10 @@ impl App {
                     };
                 }
             }
-            AppMessage::ChaptersLoaded { url, chapters } => {
-                if self.now_playing.as_ref().map(|t| t.watch_url()) == Some(url) {
-                    self.chapters = chapters;
-                }
-            }
             AppMessage::PlaylistLoaded { videos, play_immediately } => {
-                self.status_message = None;
+                self.clear_status();
                 if videos.is_empty() {
-                    self.status_message = Some("Playlist is empty or could not be loaded.".to_string());
+                    self.set_error("Playlist is empty or could not be loaded.".to_string());
                     return Ok(());
                 }
                 let total = videos.len();
@@ -653,27 +683,19 @@ impl App {
                     }
                     self.queue.clear();
                     let mut iter = videos.into_iter();
-                    if let Some(first) = iter.next() {
-                        let url = first.watch_url();
-                        self.now_playing = Some(first);
-                        self.is_paused = false;
-                        self.play_start = None; // anchored once mpv reports a real Position
-                        self.paused_elapsed = 0.0;
-                        self.chapters.clear();
-                        self.consecutive_failures = 0;
-                        self.retries_current_track = 0;
-                        self.player.play_url(&url).await?;
-                        self.fetch_chapters_for(&url);
-                    }
+                    let first = iter.next();
                     for video in iter {
                         self.queue.push_back(video);
                     }
-                    self.update_media_controls();
+                    if let Some(first) = first {
+                        self.consecutive_failures = 0;
+                        self.start_track(first).await?;
+                    }
                 } else {
                     for video in videos {
                         self.queue.push_back(video);
                     }
-                    self.status_message = Some(format!("Added {} tracks to queue", total));
+                    self.set_status(format!("Added {} tracks to queue", total));
                 }
             }
             AppMessage::MoreResults(all_results) => {
@@ -698,6 +720,91 @@ impl App {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn is_current_track(&self, watch_url: &str) -> bool {
+        self.now_playing
+            .as_ref()
+            .is_some_and(|t| t.watch_url() == watch_url)
+    }
+
+    /// A track failed to start or died mid-stream — either yt-dlp couldn't
+    /// resolve it or mpv exited non-zero on the resolved URL.
+    async fn on_playback_error(&mut self, e: String) -> Result<()> {
+        let failed_track = self.now_playing.take();
+        self.is_paused = false;
+        self.play_start = None;
+        self.chapters.clear();
+
+        // Whatever was cached for this track is suspect now — a signed URL
+        // that just 403'd will keep 403ing, so drop it and make the retry go
+        // back to yt-dlp for a fresh one.
+        if let Some(ref track) = failed_track {
+            crate::stream::invalidate(&track.watch_url());
+        }
+
+        // YouTube's signed CDN URLs are prone to a transient 403 that has
+        // nothing to do with the video itself — the very same URL can fail
+        // once and succeed moments later. Give the same track a couple of
+        // fresh attempts (new extraction, new signed URL each time) before
+        // treating this as a real failure and burning a consecutive-failure
+        // slot / advancing the queue. A short pause before retrying gives
+        // whatever transient condition caused the 403 a moment to clear
+        // instead of immediately racing into the same failure.
+        if self.retries_current_track < MAX_RETRIES_PER_TRACK {
+            if let Some(track) = failed_track {
+                self.retries_current_track += 1;
+                self.set_error(format!(
+                    "Audio error: {e} — retrying ({}/{MAX_RETRIES_PER_TRACK})",
+                    self.retries_current_track
+                ));
+                crate::logline!(
+                    "app: retrying \"{}\" after error (attempt {}/{MAX_RETRIES_PER_TRACK}): {e}",
+                    track.title,
+                    self.retries_current_track
+                );
+                tokio::time::sleep(RETRY_DELAY).await;
+                let url = track.watch_url();
+                self.now_playing = Some(track);
+                self.paused_elapsed = 0.0;
+                self.begin_stream(&url).await?;
+                self.update_media_controls();
+                return Ok(());
+            }
+        }
+        self.retries_current_track = 0;
+
+        self.consecutive_failures += 1;
+        crate::logline!(
+            "app: AudioError #{} (after {MAX_RETRIES_PER_TRACK} retries): {e} ({} left in queue)",
+            self.consecutive_failures,
+            self.queue.len()
+        );
+        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            // Several tracks in a row failed to play even after a retry each —
+            // this is almost certainly a systemic problem (network, rate
+            // limiting, broken yt-dlp), not one-off bad luck. Stop racing
+            // through the queue and surface it clearly instead of silently
+            // draining every track down to an empty queue.
+            self.set_error(format!(
+                "Audio error: {e} — {} tracks failed in a row, stopped auto-skip ({} left in queue)",
+                self.consecutive_failures,
+                self.queue.len()
+            ));
+            crate::logline!("app: hit MAX_CONSECUTIVE_FAILURES, stopping auto-skip");
+            self.update_media_controls();
+        } else {
+            // The track never actually played, so it doesn't belong in
+            // history — just drop it and, if there's more queued, move on
+            // rather than leaving playback silently stalled.
+            if let Some(next) = self.queue.pop_front() {
+                self.start_track(next).await?;
+            } else {
+                self.update_media_controls();
+            }
+            self.set_error(format!("Audio error: {e} — skipping to next"));
         }
         Ok(())
     }
@@ -776,7 +883,7 @@ impl App {
         if let Some(result) = self.search_results.get(self.selected_index).cloned() {
             if result.is_playlist {
                 let url = result.watch_url();
-                self.status_message = Some(format!("Loading playlist \"{}\"...", &result.title.chars().take(35).collect::<String>()));
+                self.set_status(format!("Loading playlist \"{}\"...", &result.title.chars().take(35).collect::<String>()));
                 let tx = self.msg_tx.clone();
                 tokio::spawn(async move {
                     match crate::youtube::fetch_playlist(&url).await {
@@ -790,17 +897,8 @@ impl App {
                 self.history.push(prev);
             }
             self.queue.clear();
-            let url = result.watch_url();
-            self.now_playing = Some(result);
-            self.is_paused = false;
-            self.play_start = None; // anchored once mpv reports a real Position
-            self.paused_elapsed = 0.0;
-            self.chapters.clear();
             self.consecutive_failures = 0;
-            self.retries_current_track = 0;
-            self.player.play_url(&url).await?;
-            self.fetch_chapters_for(&url);
-            self.update_media_controls();
+            self.start_track(result).await?;
         }
         Ok(())
     }
@@ -810,17 +908,8 @@ impl App {
             if let Some(current) = self.now_playing.take() {
                 self.history.push(current);
             }
-            let url = next.watch_url();
-            self.now_playing = Some(next);
-            self.is_paused = false;
-            self.play_start = None; // anchored once mpv reports a real Position
-            self.paused_elapsed = 0.0;
-            self.chapters.clear();
             self.consecutive_failures = 0;
-            self.retries_current_track = 0;
-            self.player.play_url(&url).await?;
-            self.fetch_chapters_for(&url);
-            self.update_media_controls();
+            self.start_track(next).await?;
         }
         Ok(())
     }
@@ -830,17 +919,8 @@ impl App {
             if let Some(current) = self.now_playing.take() {
                 self.queue.push_front(current);
             }
-            let url = prev.watch_url();
-            self.now_playing = Some(prev);
-            self.is_paused = false;
-            self.play_start = None; // anchored once mpv reports a real Position
-            self.paused_elapsed = 0.0;
-            self.chapters.clear();
             self.consecutive_failures = 0;
-            self.retries_current_track = 0;
-            self.player.play_url(&url).await?;
-            self.fetch_chapters_for(&url);
-            self.update_media_controls();
+            self.start_track(prev).await?;
         }
         Ok(())
     }
@@ -850,7 +930,7 @@ impl App {
             if result.is_playlist {
                 let play_immediately = self.now_playing.is_none();
                 let url = result.watch_url();
-                self.status_message = Some(format!("Loading playlist \"{}\"...", &result.title.chars().take(35).collect::<String>()));
+                self.set_status(format!("Loading playlist \"{}\"...", &result.title.chars().take(35).collect::<String>()));
                 let tx = self.msg_tx.clone();
                 tokio::spawn(async move {
                     match crate::youtube::fetch_playlist(&url).await {
@@ -862,25 +942,17 @@ impl App {
             }
             if self.now_playing.is_none() {
                 // Nothing playing — start immediately without touching the queue.
-                let url = result.watch_url();
-                self.now_playing = Some(result);
-                self.is_paused = false;
-                self.play_start = None; // anchored once mpv reports a real Position
-                self.paused_elapsed = 0.0;
-                self.chapters.clear();
                 self.consecutive_failures = 0;
-                self.retries_current_track = 0;
-                self.player.play_url(&url).await?;
-                self.fetch_chapters_for(&url);
-                self.update_media_controls();
+                self.start_track(result).await?;
             } else {
                 let title = result.title.clone();
                 self.queue.push_back(result);
-                self.status_message = Some(format!(
+                self.set_status(format!(
                     "Added to queue ({} tracks): {}",
                     self.queue.len(),
                     &title[..title.len().min(40)]
                 ));
+                self.prefetch_next();
             }
         }
         Ok(())

@@ -113,9 +113,10 @@ The first build will take a minute to compile all dependencies.
 
 1. **Search** — queries YouTube via `yt-dlp` and returns the top 20 results with thumbnails and metadata
 2. **yt-dlp auto-setup** — on first run the app checks for `yt-dlp` in `$PATH`; if absent, downloads the official standalone binary to `~/.cache/listen_to_it/` automatically
-3. **Playback** — `mpv` receives the YouTube URL and resolves the best audio stream via its built-in `yt-dlp` integration, communicating with the app through a Unix socket (`/tmp/listen_to_it_mpv.sock`) for pause, seek, and volume control
-4. **Thumbnails** — downloaded asynchronously and rendered inline using `ratatui-image` if the terminal supports a graphics protocol
-5. **MPRIS2** — `souvlaki` publishes the current track metadata on D-Bus so media keys and widgets (e.g. waybar, playerctl) work normally
+3. **Stream resolution** — the app runs `yt-dlp` itself to turn a video into a direct audio URL, caches the result, and resolves ahead of time (the next queued track, and whichever search row you're reading) so pressing play usually costs nothing
+4. **Playback** — `mpv` gets that already-resolved URL, communicating with the app through a Unix socket (`/tmp/listen_to_it_mpv.sock`) for pause, seek, and volume control
+5. **Thumbnails** — downloaded asynchronously and rendered inline using `ratatui-image` if the terminal supports a graphics protocol
+6. **MPRIS2** — `souvlaki` publishes the current track metadata on D-Bus so media keys and widgets (e.g. waybar, playerctl) work normally
 
 ---
 
