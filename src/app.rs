@@ -37,7 +37,12 @@ pub enum AppMessage {
     /// with, so ticks from rows the user has already scrolled past are ignored.
     PrefetchSelected(u64),
     MoreResults(Vec<VideoResult>),
-    PlaylistLoaded { videos: Vec<VideoResult>, play_immediately: bool },
+    /// First entries of a playlist, as soon as yt-dlp yields them — playback
+    /// starts here rather than waiting for the whole playlist to be walked.
+    PlaylistHead { token: u64, videos: Vec<VideoResult>, play_immediately: bool },
+    /// A later batch of the same playlist, appended to the queue behind the
+    /// track that is already playing.
+    PlaylistTail { token: u64, videos: Vec<VideoResult> },
     /// Lazily-fetched metadata for a playlist search row.
     PlaylistMetaLoaded { id: String, meta: crate::youtube::PlaylistMeta },
 }
@@ -142,6 +147,22 @@ pub struct App {
     /// prefetch tick only acts if its generation is still current, which
     /// debounces resolving while the user scrolls through results.
     prefetch_gen: u64,
+
+    /// Bumped every time something takes over the queue. A playlist streams in
+    /// over several seconds, so its tail can still be arriving after the user
+    /// has queued something else; batches stamped with a spent token are
+    /// dropped instead of appended to a queue they no longer belong to.
+    playlist_token: u64,
+    /// Whether the playlist currently streaming in was queued rather than
+    /// played, so its running "added N tracks" count keeps updating.
+    playlist_announces_count: bool,
+
+    /// Insertion order for `thumbnail_protocols`, used to evict the oldest.
+    thumbnail_order: VecDeque<String>,
+
+    /// Set once a "load more" comes back with nothing new: YouTube has no more
+    /// results for this query, and asking again just burns a full search.
+    search_exhausted: bool,
 }
 
 /// After this many playback failures in a row, stop auto-advancing and leave
@@ -163,6 +184,27 @@ const RETRY_DELAY: Duration = Duration::from_millis(500);
 /// nothing, short enough that a row someone is actually reading is ready by
 /// the time they hit Enter.
 const HOVER_PREFETCH_DELAY: Duration = Duration::from_millis(900);
+
+/// Results asked for by the first search of a query.
+const SEARCH_PAGE: usize = 25;
+
+/// Ceiling on how deep a single query is followed. YouTube's ranking is long
+/// past useful by here, and every extra row makes each re-search dearer.
+const MAX_SEARCH_RESULTS: usize = 200;
+
+/// How many rows from the bottom trigger a "load more". Deep enough that the
+/// (now much rarer, but slower) re-search finishes before the user arrives.
+const LOAD_MORE_LOOKAHEAD: usize = 5;
+
+/// How far either side of the highlighted row playlist metadata is fetched.
+/// Each row's "N tracks / owner / views" costs an entire yt-dlp process
+/// (~1.7 s measured), so it is worth spending only on rows in view.
+const META_WINDOW: usize = 6;
+
+/// Decoded thumbnails kept in memory. Each is a full 480×360 image held by its
+/// resize protocol — about 0.66 MB — so an uncapped map cost ~66 MB per
+/// hundred rows browsed, on top of everything else the session is holding.
+const MAX_CACHED_THUMBNAILS: usize = 32;
 
 impl App {
     pub fn new(msg_tx: UnboundedSender<AppMessage>, picker: Picker, has_image_support: bool) -> Self {
@@ -213,6 +255,10 @@ impl App {
             retries_current_track: 0,
             track_started_at: None,
             prefetch_gen: 0,
+            playlist_token: 0,
+            playlist_announces_count: false,
+            thumbnail_order: VecDeque::new(),
+            search_exhausted: false,
         }
     }
 
@@ -301,6 +347,7 @@ impl App {
     /// be resolved if it stays put.
     fn on_selection_changed(&mut self) {
         self.request_selected_thumbnail();
+        self.request_playlist_meta();
         self.schedule_selection_prefetch();
     }
 
@@ -422,7 +469,10 @@ impl App {
                     self.selected_index += 1;
                     self.on_selection_changed();
                     let remaining = self.search_results.len().saturating_sub(self.selected_index + 1);
-                    if remaining <= 2 && !self.is_loading_more && !self.search_query.is_empty() {
+                    if remaining <= LOAD_MORE_LOOKAHEAD
+                        && !self.is_loading_more
+                        && !self.search_query.is_empty()
+                    {
                         self.load_more_results();
                     }
                 }
@@ -489,12 +539,14 @@ impl App {
         self.thumbnails_loading.clear();
         self.thumbnails_failed.clear();
         self.playlist_meta_requested.clear();
+        self.thumbnail_order.clear();
+        self.search_exhausted = false;
 
         self.search_query = self.search_input.clone();
         let query = self.search_query.clone();
         let tx = self.msg_tx.clone();
         tokio::spawn(async move {
-            match crate::youtube::search(&query, 20).await {
+            match crate::youtube::search(&query, SEARCH_PAGE).await {
                 Ok(results) => {
                     let _ = tx.send(AppMessage::SearchResults(results));
                 }
@@ -522,11 +574,17 @@ impl App {
         });
     }
 
-    /// Kick off a one-time metadata fetch for every playlist row in the current
-    /// results that hasn't been requested yet (owner, track count, total views).
+    /// Kick off a one-time metadata fetch (owner, track count, total views) for
+    /// the playlist rows near the selection that haven't been requested yet.
+    ///
+    /// Deliberately not every playlist row in the results: a typical search
+    /// carries ten of them, and firing one yt-dlp process per row the instant
+    /// results landed put ten Python processes on the machine at once, all
+    /// racing whatever the user was actually trying to play.
     fn request_playlist_meta(&mut self) {
-        let pending: Vec<(String, String)> = self
-            .search_results
+        let lo = self.selected_index.saturating_sub(META_WINDOW);
+        let hi = (self.selected_index + META_WINDOW + 1).min(self.search_results.len());
+        let pending: Vec<(String, String)> = self.search_results[lo..hi]
             .iter()
             .filter(|r| r.is_playlist && !self.playlist_meta_requested.contains(&r.id))
             .map(|r| (r.id.clone(), r.watch_url()))
@@ -542,6 +600,31 @@ impl App {
         }
     }
 
+    /// Keep the decoded-thumbnail map to `MAX_CACHED_THUMBNAILS`, oldest first.
+    /// Browsing a long result list otherwise accumulates every image it ever
+    /// showed; the row on screen is never evicted, since it is about to be
+    /// drawn again.
+    fn evict_old_thumbnails(&mut self) {
+        let on_screen = self
+            .search_results
+            .get(self.selected_index)
+            .map(|r| r.id.clone());
+        // Bounded by the queue length rather than `while over capacity`: the
+        // on-screen id gets rotated to the back rather than dropped, and an
+        // unbounded loop would spin on it if it were ever the only candidate.
+        for _ in 0..self.thumbnail_order.len() {
+            if self.thumbnail_protocols.len() <= MAX_CACHED_THUMBNAILS {
+                break;
+            }
+            let Some(oldest) = self.thumbnail_order.pop_front() else { break };
+            if Some(&oldest) == on_screen.as_ref() {
+                self.thumbnail_order.push_back(oldest);
+                continue;
+            }
+            self.thumbnail_protocols.remove(&oldest);
+        }
+    }
+
     fn request_selected_thumbnail(&mut self) {
         if let Some(result) = self.search_results.get(self.selected_index) {
             let id = result.id.clone();
@@ -550,10 +633,22 @@ impl App {
         }
     }
 
+    /// Ask YouTube for a deeper slice of the current query.
+    ///
+    /// There is no resumable offset on the results page: yt-dlp always starts
+    /// from the top and re-walks everything, so each call costs more than the
+    /// last (measured: 1.6 s for 20 rows, 3.8 s for 41) and returns rows we
+    /// already have. Growing the target geometrically pays that rising cost
+    /// O(log n) times over a session instead of once every three rows, which
+    /// is what made browsing get slower the longer it went on.
     fn load_more_results(&mut self) {
+        let have = self.search_results.len();
+        if self.search_exhausted || have >= MAX_SEARCH_RESULTS {
+            return;
+        }
         self.is_loading_more = true;
         let query = self.search_query.clone();
-        let total = self.search_results.len() + 3;
+        let total = (have * 2).max(have + SEARCH_PAGE).min(MAX_SEARCH_RESULTS);
         let tx = self.msg_tx.clone();
         tokio::spawn(async move {
             let results = crate::youtube::search(&query, total).await.unwrap_or_default();
@@ -589,7 +684,10 @@ impl App {
             AppMessage::ThumbnailLoaded { video_id, image } => {
                 self.thumbnails_loading.remove(&video_id);
                 let protocol = self.picker.new_resize_protocol(image);
-                self.thumbnail_protocols.insert(video_id, protocol);
+                if self.thumbnail_protocols.insert(video_id.clone(), protocol).is_none() {
+                    self.thumbnail_order.push_back(video_id);
+                }
+                self.evict_old_thumbnails();
             }
             AppMessage::ThumbnailFailed(video_id) => {
                 self.thumbnails_loading.remove(&video_id);
@@ -670,13 +768,15 @@ impl App {
                     };
                 }
             }
-            AppMessage::PlaylistLoaded { videos, play_immediately } => {
+            AppMessage::PlaylistHead { token, videos, play_immediately } => {
+                if token != self.playlist_token {
+                    return Ok(()); // a playlist the user has already moved on from
+                }
                 self.clear_status();
                 if videos.is_empty() {
                     self.set_error("Playlist is empty or could not be loaded.".to_string());
                     return Ok(());
                 }
-                let total = videos.len();
                 if play_immediately {
                     if let Some(prev) = self.now_playing.take() {
                         self.history.push(prev);
@@ -692,10 +792,37 @@ impl App {
                         self.start_track(first).await?;
                     }
                 } else {
+                    self.playlist_announces_count = true;
+                    let start_empty = self.now_playing.is_none() && self.queue.is_empty();
                     for video in videos {
                         self.queue.push_back(video);
                     }
-                    self.set_status(format!("Added {} tracks to queue", total));
+                    // Nothing was playing, so the queue alone would just sit
+                    // there — start it on the first track that arrived.
+                    if start_empty {
+                        if let Some(first) = self.queue.pop_front() {
+                            self.consecutive_failures = 0;
+                            self.start_track(first).await?;
+                        }
+                    }
+                    self.set_status(format!("Added {} tracks to queue", self.queue.len()));
+                }
+            }
+            AppMessage::PlaylistTail { token, videos } => {
+                if token != self.playlist_token || videos.is_empty() {
+                    return Ok(());
+                }
+                let queue_was_empty = self.queue.is_empty();
+                for video in videos {
+                    self.queue.push_back(video);
+                }
+                // The head was short enough that `start_track` found nothing to
+                // resolve ahead; now there is.
+                if queue_was_empty {
+                    self.prefetch_next();
+                }
+                if self.playlist_announces_count && !self.status_is_error {
+                    self.set_status(format!("Added {} tracks to queue", self.queue.len()));
                 }
             }
             AppMessage::MoreResults(all_results) => {
@@ -706,6 +833,10 @@ impl App {
                     .into_iter()
                     .filter(|r| !existing.contains(&r.id))
                     .collect();
+                // Nothing new came back, so YouTube has no more for this query.
+                // Without this the next `j` near the bottom fires another full
+                // re-search, and every one after that, forever.
+                self.search_exhausted = new_results.is_empty();
                 self.search_results.extend(new_results);
                 self.request_playlist_meta();
             }
@@ -884,15 +1015,10 @@ impl App {
             if result.is_playlist {
                 let url = result.watch_url();
                 self.set_status(format!("Loading playlist \"{}\"...", &result.title.chars().take(35).collect::<String>()));
-                let tx = self.msg_tx.clone();
-                tokio::spawn(async move {
-                    match crate::youtube::fetch_playlist(&url).await {
-                        Ok(videos) => { let _ = tx.send(AppMessage::PlaylistLoaded { videos, play_immediately: true }); }
-                        Err(e) => { let _ = tx.send(AppMessage::SearchError(e.to_string())); }
-                    }
-                });
+                self.start_playlist_load(url, true);
                 return Ok(());
             }
+            self.playlist_token = self.playlist_token.wrapping_add(1);
             if let Some(prev) = self.now_playing.take() {
                 self.history.push(prev);
             }
@@ -901,6 +1027,23 @@ impl App {
             self.start_track(result).await?;
         }
         Ok(())
+    }
+
+    /// Start streaming a playlist into the queue, invalidating any playlist
+    /// still arriving from a previous request.
+    fn start_playlist_load(&mut self, url: String, play_immediately: bool) {
+        self.playlist_token = self.playlist_token.wrapping_add(1);
+        self.playlist_announces_count = false;
+        let token = self.playlist_token;
+        let tx = self.msg_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::youtube::fetch_playlist_streamed(&url, token, play_immediately, tx.clone())
+                    .await
+            {
+                let _ = tx.send(AppMessage::SearchError(e.to_string()));
+            }
+        });
     }
 
     async fn skip_next(&mut self) -> Result<()> {
@@ -928,16 +1071,12 @@ impl App {
     async fn queue_selected(&mut self) -> Result<()> {
         if let Some(result) = self.search_results.get(self.selected_index).cloned() {
             if result.is_playlist {
-                let play_immediately = self.now_playing.is_none();
                 let url = result.watch_url();
                 self.set_status(format!("Loading playlist \"{}\"...", &result.title.chars().take(35).collect::<String>()));
-                let tx = self.msg_tx.clone();
-                tokio::spawn(async move {
-                    match crate::youtube::fetch_playlist(&url).await {
-                        Ok(videos) => { let _ = tx.send(AppMessage::PlaylistLoaded { videos, play_immediately }); }
-                        Err(e) => { let _ = tx.send(AppMessage::SearchError(e.to_string())); }
-                    }
-                });
+                // Always "queue": the head handler starts the first track by
+                // itself when nothing is playing, and by the time the tail
+                // arrives that decision has already been made correctly.
+                self.start_playlist_load(url, false);
                 return Ok(());
             }
             if self.now_playing.is_none() {
@@ -1063,5 +1202,122 @@ impl App {
         }
         self.player.seek_abs(target).await.ok();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui_image::picker::Picker;
+
+    fn track(i: usize) -> VideoResult {
+        VideoResult {
+            id: format!("v{i}"),
+            title: format!("track {i}"),
+            url: Some(format!("https://www.youtube.com/watch?v=v{i}")),
+            duration: Some(180.0),
+            view_count: None,
+            channel: None,
+            uploader: None,
+            thumbnail: None,
+            is_playlist: false,
+            playlist_count: None,
+        }
+    }
+
+    fn app() -> App {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // Keep the receiver alive; dropping it makes every send fail.
+        std::mem::forget(rx);
+        App::new(tx, Picker::from_fontsize((8, 12)), false)
+    }
+
+    /// A playlist arrives in pieces, so the tail has to land behind the head in
+    /// the queue rather than replacing it or being dropped.
+    #[tokio::test]
+    async fn playlist_tail_appends_behind_the_head() {
+        let mut app = app();
+        app.now_playing = Some(track(99)); // something already playing
+        let token = app.playlist_token;
+
+        app.handle_message(AppMessage::PlaylistHead {
+            token,
+            videos: vec![track(1), track(2)],
+            play_immediately: false,
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.queue.len(), 2);
+
+        app.handle_message(AppMessage::PlaylistTail { token, videos: vec![track(3)] })
+            .await
+            .unwrap();
+
+        let ids: Vec<&str> = app.queue.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, ["v1", "v2", "v3"]);
+        assert_eq!(app.status_message.as_deref(), Some("Added 3 tracks to queue"));
+    }
+
+    /// The tail of a 5000-track playlist can still be arriving seconds after
+    /// the user has moved on. Those batches must not pile into the new queue.
+    #[tokio::test]
+    async fn a_stale_playlist_tail_is_dropped() {
+        let mut app = app();
+        app.now_playing = Some(track(99));
+        let old_token = app.playlist_token;
+
+        app.handle_message(AppMessage::PlaylistHead {
+            token: old_token,
+            videos: vec![track(1)],
+            play_immediately: false,
+        })
+        .await
+        .unwrap();
+
+        // The user queues something else, which takes over the queue.
+        app.start_playlist_load("https://example.invalid/list".to_string(), false);
+        app.queue.clear();
+
+        app.handle_message(AppMessage::PlaylistTail {
+            token: old_token,
+            videos: vec![track(2), track(3)],
+        })
+        .await
+        .unwrap();
+
+        assert!(app.queue.is_empty(), "tail from the abandoned playlist leaked in");
+    }
+
+    /// Browsing a long result list used to hold every thumbnail it ever
+    /// decoded — roughly 0.66 MB apiece.
+    #[tokio::test]
+    async fn thumbnail_cache_stays_bounded() {
+        let mut app = app();
+        for i in 0..MAX_CACHED_THUMBNAILS * 3 {
+            let id = format!("v{i}");
+            let image = image::DynamicImage::new_rgb8(4, 4);
+            app.handle_message(AppMessage::ThumbnailLoaded { video_id: id, image })
+                .await
+                .unwrap();
+        }
+        assert_eq!(app.thumbnail_protocols.len(), MAX_CACHED_THUMBNAILS);
+        assert_eq!(app.thumbnail_order.len(), MAX_CACHED_THUMBNAILS);
+    }
+
+    /// Once YouTube has no more results, asking again costs a full re-search
+    /// and returns nothing — it must not be retried on every keypress.
+    #[tokio::test]
+    async fn exhausted_search_stops_reloading() {
+        let mut app = app();
+        app.search_query = "anything".to_string();
+        app.search_results = (0..5).map(track).collect();
+
+        app.handle_message(AppMessage::MoreResults((0..5).map(track).collect()))
+            .await
+            .unwrap();
+        assert!(app.search_exhausted, "no new ids came back, so the query is spent");
+
+        app.load_more_results();
+        assert!(!app.is_loading_more, "a spent query must not fire another search");
     }
 }

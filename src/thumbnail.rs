@@ -16,5 +16,8 @@ pub async fn load(video_id: String, url: String, tx: UnboundedSender<AppMessage>
 
 async fn fetch(url: &str) -> Result<DynamicImage> {
     let bytes = reqwest::get(url).await?.bytes().await?;
-    Ok(image::load_from_memory(&bytes)?)
+    // Decoding a 480×360 JPEG is CPU work, not IO. Left inline it occupies a
+    // runtime worker for the whole decode, which is exactly the thread that
+    // should be draining a yt-dlp pipe or driving the UI.
+    Ok(tokio::task::spawn_blocking(move || image::load_from_memory(&bytes)).await??)
 }

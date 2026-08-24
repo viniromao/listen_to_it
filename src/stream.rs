@@ -67,11 +67,23 @@ fn url_lock(watch_url: &str) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
     let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = locks.lock().expect("stream lock map poisoned");
+    // Every URL ever hovered, prefetched or played lands here, and a long
+    // session touches thousands. Drop the ones nobody is holding any more —
+    // an entry only matters while a resolve for that URL is actually in
+    // flight, which is exactly when its Arc has another owner.
+    if guard.len() > LOCK_MAP_HIGH_WATER {
+        guard.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
     guard
         .entry(watch_url.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }
+
+/// Size at which the per-URL lock map is swept for entries nobody holds.
+/// Comfortably above any plausible number of concurrent resolves, so the sweep
+/// is rare and never drops a lock that is doing its job.
+const LOCK_MAP_HIGH_WATER: usize = 64;
 
 /// An already-resolved, still-valid stream for `watch_url`, if there is one.
 pub fn cached(watch_url: &str) -> Option<Arc<Stream>> {
@@ -176,6 +188,15 @@ pub fn prefetch(watch_url: String) {
         return;
     }
     tokio::spawn(async move {
+        // Speculative, so it queues behind a permit: hovering down a list of
+        // results would otherwise line up a yt-dlp process per row, each one
+        // competing with the track actually being played.
+        let _permit = crate::ytdlp::background_permit().await;
+        // The guess may have gone stale while waiting — the user has moved on,
+        // or a foreground play already resolved this very URL.
+        if cached(&watch_url).is_some() {
+            return;
+        }
         if let Err(e) = resolve(&watch_url).await {
             crate::logline!("stream: prefetch of {watch_url} failed: {e}");
         }

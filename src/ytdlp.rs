@@ -203,3 +203,24 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> Option<i64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     Some(era * 146097 + doe as i64 - 719468)
 }
+
+/// How many *speculative* yt-dlp processes may run at once.
+///
+/// yt-dlp here is a PyInstaller bundle: ~0.4 s of pure startup before it makes
+/// a single request (measured), and tens of megabytes resident while it runs.
+/// Background work asks for a lot of them — a search with ten playlist rows in
+/// it used to spawn ten at the instant results landed, all racing the track the
+/// user actually pressed Enter on. Two is enough to keep prefetching useful
+/// without letting it own the machine.
+const BACKGROUND_YTDLP_LIMIT: usize = 2;
+
+/// A permit for speculative yt-dlp work (hover prefetch, playlist row
+/// metadata). Foreground resolution — the track being played right now —
+/// deliberately does *not* take one, so it can never queue behind guesses.
+pub async fn background_permit() -> tokio::sync::SemaphorePermit<'static> {
+    static SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(BACKGROUND_YTDLP_LIMIT))
+        .acquire()
+        .await
+        .expect("background yt-dlp semaphore is never closed")
+}

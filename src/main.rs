@@ -44,7 +44,16 @@ async fn check_mpv() -> Result<()> {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
+/// A multi-threaded runtime, deliberately.
+///
+/// Everything here shares one process: the UI loop, the yt-dlp child processes
+/// whose output has to be drained, the thumbnail fetches, and the JPEG decodes.
+/// On a `current_thread` runtime they all take turns on the *same* thread, so a
+/// decode or a slow render stalled the very futures that were meant to be
+/// fetching the next track in the background. `main` still runs on this thread
+/// via `block_on`, so the non-`Send` bits it holds (media controls, the image
+/// picker) are unaffected.
+#[tokio::main]
 async fn main() -> Result<()> {
     match logging::init() {
         Ok(path) => eprintln!("Logging to {}", path.display()),
