@@ -22,7 +22,7 @@ serde_json = "1"
 souvlaki = "0.8.3"
 tokio = { version = "1", features = ["full"] }
 unicode-width = "0.2"
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # The profile that 'dist' will build with
 [profile.dist]
