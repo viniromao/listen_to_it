@@ -201,35 +201,180 @@ async fn download_latest(dest: &Path) -> Result<()> {
 }
 
 /// Extract a onedir zip into `into`, preserving the executable bit.
+///
+/// Hand-rolled rather than taken from a crate. `flate2` is already in the tree
+/// — `image` decodes PNG through it — so reading an archive this plain (no
+/// encryption, no zip64, one disk) costs no new dependencies at all, and a
+/// machine that cannot reach crates.io can still build the project.
 fn unpack(bytes: &[u8], into: &Path) -> Result<()> {
-    let mut archive =
-        zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("yt-dlp archive is not a zip")?;
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        // `enclosed_name` rejects paths that would escape the target directory.
-        let Some(rel) = entry.enclosed_name() else { continue };
+    use std::io::Read;
+
+    for entry in central_directory(bytes)? {
+        let Some(rel) = safe_path(&entry.name) else {
+            anyhow::bail!("zip entry would write outside the target: {}", entry.name);
+        };
         let out = into.join(rel);
-        if entry.is_dir() {
+        if entry.name.ends_with('/') {
             std::fs::create_dir_all(&out)?;
             continue;
         }
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = std::fs::File::create(&out)
-            .with_context(|| format!("failed to create {}", out.display()))?;
-        std::io::copy(&mut entry, &mut file)?;
+
+        let raw = entry_data(bytes, &entry)?;
+        let data = match entry.method {
+            METHOD_STORE => raw.to_vec(),
+            METHOD_DEFLATE => {
+                let mut buf = Vec::with_capacity(entry.uncompressed_size);
+                flate2::read::DeflateDecoder::new(raw)
+                    .read_to_end(&mut buf)
+                    .with_context(|| format!("failed to inflate {}", entry.name))?;
+                buf
+            }
+            other => anyhow::bail!("unsupported compression method {other} for {}", entry.name),
+        };
+
+        // This is an executable about to be run, fetched over the network:
+        // worth confirming it arrived intact rather than discovering it as a
+        // mystery crash later.
+        anyhow::ensure!(
+            data.len() == entry.uncompressed_size,
+            "size mismatch for {}",
+            entry.name
+        );
+        let mut crc = flate2::Crc::new();
+        crc.update(&data);
+        anyhow::ensure!(crc.sum() == entry.crc32, "checksum mismatch for {}", entry.name);
+
+        std::fs::write(&out, &data)
+            .with_context(|| format!("failed to write {}", out.display()))?;
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // The bundle ships its own modes; the executable and the shared
-            // libraries beside it are useless without them.
-            if let Some(mode) = entry.unix_mode() {
+            // The bundle ships its own modes; the launcher and the shared
+            // libraries beside it are useless without the executable bit.
+            if let Some(mode) = entry.unix_mode {
                 std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode))?;
             }
         }
     }
     Ok(())
+}
+
+const METHOD_STORE: u16 = 0;
+const METHOD_DEFLATE: u16 = 8;
+
+/// One file in the archive, as described by its central-directory record.
+struct ZipEntry {
+    name: String,
+    method: u16,
+    crc32: u32,
+    compressed_size: usize,
+    uncompressed_size: usize,
+    local_offset: usize,
+    unix_mode: Option<u32>,
+}
+
+/// The archive's central directory — the authoritative index. Sizes in the
+/// local headers can legally be left zero and deferred to a trailing data
+/// descriptor, so they are read from here instead.
+fn central_directory(bytes: &[u8]) -> Result<Vec<ZipEntry>> {
+    const EOCD_SIG: &[u8] = b"PK\x05\x06";
+    const CENTRAL_SIG: u32 = 0x0201_4b50;
+
+    // The trailing comment may be up to 64 KiB, so the record can sit that far
+    // from the end.
+    let window = bytes.len().min(66 * 1024);
+    let from = bytes.len() - window;
+    let eocd = bytes[from..]
+        .windows(4)
+        .rposition(|w| w == EOCD_SIG)
+        .map(|at| from + at)
+        .context("not a zip archive: no end-of-central-directory record")?;
+
+    let count = u16_at(bytes, eocd + 10)?;
+    let offset = u32_at(bytes, eocd + 16)?;
+    anyhow::ensure!(
+        count != u16::MAX && offset != u32::MAX,
+        "zip64 archives are not supported"
+    );
+
+    let mut entries = Vec::with_capacity(count as usize);
+    let mut at = offset as usize;
+    for _ in 0..count {
+        anyhow::ensure!(
+            u32_at(bytes, at)? == CENTRAL_SIG,
+            "malformed zip central directory"
+        );
+        let name_len = u16_at(bytes, at + 28)? as usize;
+        let extra_len = u16_at(bytes, at + 30)? as usize;
+        let comment_len = u16_at(bytes, at + 32)? as usize;
+        // The high half of the external attributes carries the unix mode, and
+        // is zero for archives written on Windows.
+        let external = u32_at(bytes, at + 38)? >> 16;
+        let name = bytes
+            .get(at + 46..at + 46 + name_len)
+            .context("truncated zip central directory")?;
+
+        entries.push(ZipEntry {
+            name: String::from_utf8(name.to_vec()).context("zip entry name is not utf-8")?,
+            method: u16_at(bytes, at + 10)?,
+            crc32: u32_at(bytes, at + 16)?,
+            compressed_size: u32_at(bytes, at + 20)? as usize,
+            uncompressed_size: u32_at(bytes, at + 24)? as usize,
+            local_offset: u32_at(bytes, at + 42)? as usize,
+            unix_mode: (external != 0).then_some(external),
+        });
+        at += 46 + name_len + extra_len + comment_len;
+    }
+    Ok(entries)
+}
+
+/// The raw (still compressed) bytes of one entry.
+fn entry_data<'a>(bytes: &'a [u8], entry: &ZipEntry) -> Result<&'a [u8]> {
+    const LOCAL_SIG: u32 = 0x0403_4b50;
+
+    let at = entry.local_offset;
+    anyhow::ensure!(
+        u32_at(bytes, at)? == LOCAL_SIG,
+        "malformed local header for {}",
+        entry.name
+    );
+    // The local header carries its own name and extra lengths, and the extra
+    // field is routinely a different size from the central directory's.
+    let name_len = u16_at(bytes, at + 26)? as usize;
+    let extra_len = u16_at(bytes, at + 28)? as usize;
+    let from = at + 30 + name_len + extra_len;
+    bytes
+        .get(from..from + entry.compressed_size)
+        .with_context(|| format!("truncated zip data for {}", entry.name))
+}
+
+/// A relative path that cannot escape the directory being extracted into.
+fn safe_path(name: &str) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for part in name.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => return None,
+            // A backslash or drive letter would be a path separator on Windows.
+            p if p.contains('\\') || p.contains(':') => return None,
+            p => out.push(p),
+        }
+    }
+    (!out.as_os_str().is_empty()).then_some(out)
+}
+
+fn u16_at(bytes: &[u8], at: usize) -> Result<u16> {
+    let b = bytes.get(at..at + 2).context("truncated zip archive")?;
+    Ok(u16::from_le_bytes([b[0], b[1]]))
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> Result<u32> {
+    let b = bytes.get(at..at + 4).context("truncated zip archive")?;
+    Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 /// Version string of a `yt-dlp` on PATH, if there is a working one.
@@ -303,4 +448,59 @@ pub async fn background_permit() -> tokio::sync::SemaphorePermit<'static> {
         .acquire()
         .await
         .expect("background yt-dlp semaphore is never closed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Extraction has to be exact: this bundle is an executable that gets run.
+    /// Checked against the real release archive rather than a synthetic one,
+    /// so entry modes, deflate/store mixes and directory records are all the
+    /// genuine article. Needs the network, so it is opt-in.
+    #[tokio::test]
+    #[ignore = "requires network"]
+    async fn unpacks_a_real_release_archive() {
+        let url = format!("{RELEASE_URL}/{}", ASSET.zip);
+        let bytes = reqwest::get(&url).await.unwrap().bytes().await.unwrap();
+
+        let into = std::env::temp_dir().join("listen_to_it_unpack_test");
+        let _ = std::fs::remove_dir_all(&into);
+        unpack(&bytes, &into).unwrap();
+
+        let exe = into.join(ASSET.exe);
+        assert!(exe.is_file(), "{} missing from the bundle", ASSET.exe);
+        assert!(into.join("_internal").is_dir(), "_internal/ missing");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&exe).unwrap().permissions().mode();
+            assert!(mode & 0o111 != 0, "launcher is not executable: {mode:o}");
+        }
+
+        // The point of the whole exercise: it runs, and it runs fast.
+        let started = std::time::Instant::now();
+        let out = tokio::process::Command::new(&exe)
+            .arg("--version")
+            .output()
+            .await
+            .unwrap();
+        assert!(out.status.success(), "unpacked yt-dlp did not run");
+        let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        println!("unpacked yt-dlp {version} started in {:.3}s", started.elapsed().as_secs_f64());
+        assert!(!version.is_empty());
+
+        let _ = std::fs::remove_dir_all(&into);
+    }
+
+    #[test]
+    fn traversal_paths_are_refused() {
+        assert!(safe_path("../../etc/passwd").is_none());
+        assert!(safe_path("a/../../b").is_none());
+        assert!(safe_path("C:/windows").is_none());
+        assert_eq!(safe_path("_internal/lib.so").unwrap(), PathBuf::from("_internal/lib.so"));
+        assert_eq!(safe_path("./a/./b").unwrap(), PathBuf::from("a/b"));
+        assert!(safe_path("/").is_none());
+    }
 }
