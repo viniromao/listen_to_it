@@ -2,14 +2,38 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+// The release asset to fetch, and the executable inside it.
+//
+// These are yt-dlp's **onedir** builds (the `.zip` assets), not the
+// single-file binaries next to them, and the difference is not cosmetic.
+//
+// A onefile PyInstaller build unpacks its entire ~35 MB payload — 161 files,
+// including every shared library — into a fresh temp directory on *every*
+// invocation, then deletes it. On Linux that costs about 0.23 s a call
+// (measured: 0.436 s onefile vs 0.203 s onedir for `--version`). On macOS it
+// is catastrophic: because each launch writes brand-new executable files, the
+// kernel's code-signature validation can never reuse its per-file cache and
+// re-validates the whole payload every time. Measured on an Apple Silicon Mac:
+// **15.4 s for a single `yt-dlp --version`**, paid before yt-dlp had even
+// spoken to YouTube — on every track resolved and every playlist opened.
+//
+// The onedir build writes those files once, at install time, so the OS caches
+// what it needs and startup stays flat.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const ASSET_NAME: &str = "yt-dlp_linux";
+const ASSET: Asset = Asset { zip: "yt-dlp_linux.zip", exe: "yt-dlp_linux" };
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const ASSET_NAME: &str = "yt-dlp_linux_aarch64";
+const ASSET: Asset = Asset { zip: "yt-dlp_linux_aarch64.zip", exe: "yt-dlp_linux_aarch64" };
 #[cfg(target_os = "macos")]
-const ASSET_NAME: &str = "yt-dlp_macos";
+const ASSET: Asset = Asset { zip: "yt-dlp_macos.zip", exe: "yt-dlp_macos" };
 #[cfg(target_os = "windows")]
-const ASSET_NAME: &str = "yt-dlp.exe";
+const ASSET: Asset = Asset { zip: "yt-dlp_win.zip", exe: "yt-dlp.exe" };
+
+struct Asset {
+    /// Release asset holding the onedir build.
+    zip: &'static str,
+    /// Executable inside it, alongside the `_internal/` directory it needs.
+    exe: &'static str,
+}
 
 /// yt-dlp's **nightly** channel, not stable.
 ///
@@ -79,7 +103,10 @@ pub async fn ensure() -> Result<()> {
     }
 
     let dir = cache_dir()?;
-    let cached = dir.join(if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" });
+    // The onedir bundle lives in its own directory: the executable is useless
+    // without the `_internal/` tree unpacked beside it.
+    let dist = dir.join("dist");
+    let cached = dist.join(ASSET.exe);
     let stamp = dir.join("yt-dlp.checked_at");
 
     let is_missing = !cached.exists();
@@ -120,6 +147,10 @@ pub async fn ensure() -> Result<()> {
         }
     }
 
+    // A previous version installed the single-file build here. It is ~38 MB of
+    // nothing now, and on macOS it is the slow path we just moved off.
+    let _ = std::fs::remove_file(dir.join(if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" }));
+
     let _ = BIN.set(cached);
     Ok(())
 }
@@ -132,22 +163,71 @@ fn checked_at_is_stale(stamp: &Path) -> bool {
     modified.elapsed().map(|age| age > UPDATE_CHECK_INTERVAL).unwrap_or(true)
 }
 
+/// Download the current onedir build and unpack it so that `dest` (the
+/// executable inside it) is runnable.
 async fn download_latest(dest: &Path) -> Result<()> {
-    eprintln!("Downloading yt-dlp ({ASSET_NAME})...");
-    let url = format!("{RELEASE_URL}/{ASSET_NAME}");
+    eprintln!("Downloading yt-dlp ({})...", ASSET.zip);
+    let url = format!("{RELEASE_URL}/{}", ASSET.zip);
     let bytes = reqwest::get(&url)
         .await
         .with_context(|| format!("download request to {url} failed"))?
         .error_for_status()?
         .bytes()
         .await?;
-    std::fs::write(dest, &bytes).context("failed to write yt-dlp binary")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(dest)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(dest, perms)?;
+
+    let dist = dest.parent().context("yt-dlp destination has no parent")?;
+    // Unpack beside the target and swap it in at the end, so an interrupted
+    // download can't leave a half-extracted bundle that looks installed.
+    let staging = dist.with_extension("incoming");
+    let _ = std::fs::remove_dir_all(&staging);
+    // Unpacking ~40 MB across 160-odd files is blocking filesystem work, and
+    // this runs while the UI is already up on an update check.
+    let staging = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+        unpack(&bytes, &staging)?;
+        Ok(staging)
+    })
+    .await??;
+
+    let _ = std::fs::remove_dir_all(dist);
+    std::fs::rename(&staging, dist).context("failed to install unpacked yt-dlp")?;
+
+    anyhow::ensure!(
+        dest.exists(),
+        "{} was not present in {}",
+        ASSET.exe,
+        ASSET.zip
+    );
+    Ok(())
+}
+
+/// Extract a onedir zip into `into`, preserving the executable bit.
+fn unpack(bytes: &[u8], into: &Path) -> Result<()> {
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("yt-dlp archive is not a zip")?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        // `enclosed_name` rejects paths that would escape the target directory.
+        let Some(rel) = entry.enclosed_name() else { continue };
+        let out = into.join(rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out)?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::File::create(&out)
+            .with_context(|| format!("failed to create {}", out.display()))?;
+        std::io::copy(&mut entry, &mut file)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // The bundle ships its own modes; the executable and the shared
+            // libraries beside it are useless without them.
+            if let Some(mode) = entry.unix_mode() {
+                std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode))?;
+            }
+        }
     }
     Ok(())
 }
