@@ -1,3 +1,5 @@
+use crate::input::TextInput;
+use crate::library::{DeleteTarget, Library, SavedPlaylist};
 use crate::player::Player;
 use crate::youtube::VideoResult;
 use anyhow::Result;
@@ -45,6 +47,7 @@ pub enum AppMessage {
     PlaylistTail { token: u64, videos: Vec<VideoResult> },
     /// Lazily-fetched metadata for a playlist search row.
     PlaylistMetaLoaded { id: String, meta: crate::youtube::PlaylistMeta },
+    Updated(String),
 }
 
 #[derive(Debug, Clone)]
@@ -68,12 +71,44 @@ pub enum MediaAction {
 pub enum AppMode {
     Normal,
     Searching,
+    /// "Play this now and clear the queue?"
     Confirming,
+    /// Typing a name for a playlist being created or renamed.
+    Naming,
+    /// Choosing which saved playlist the pending tracks should go into.
+    PickingPlaylist,
+    /// "Delete this playlist / remove this track?"
+    ConfirmingDelete,
+    /// The full key reference, over whatever was on screen.
+    Help,
+}
+
+/// What the main pane shows: YouTube search results, or the playlists saved
+/// on this machine.
+#[derive(PartialEq, Clone, Copy)]
+pub enum View {
+    Search,
+    Library,
+}
+
+/// Which half of the library view the keys act on.
+#[derive(PartialEq, Clone, Copy)]
+pub enum LibraryFocus {
+    Playlists,
+    Tracks,
+}
+
+/// What the name currently being typed is for.
+pub enum NameTarget {
+    /// Create a playlist, then move `pending_tracks` into it.
+    Create,
+    Rename(usize),
 }
 
 pub struct App {
     pub mode: AppMode,
-    pub search_input: String,
+    pub view: View,
+    pub search: TextInput,
     pub search_results: Vec<VideoResult>,
     pub selected_index: usize,
     pub is_searching: bool,
@@ -114,10 +149,33 @@ pub struct App {
     pub confirm_title: Option<String>,
 
     pub loop_mode: bool,
+    pub shuffle: bool,
+    pub updated_to: Option<String>,
     pub chapters: Vec<Chapter>,
     pub search_query: String,
     pub is_loading_more: bool,
-    pub search_cursor: usize,
+
+    /// Playlists saved on this machine, and the file they came from.
+    pub library: Library,
+    /// Highlighted playlist in the library view.
+    pub library_selected: usize,
+    /// Highlighted track within that playlist.
+    pub library_track_selected: usize,
+    pub library_focus: LibraryFocus,
+
+    /// The playlist name being typed, and what it will be used for.
+    pub name_input: TextInput,
+    pub name_target: Option<NameTarget>,
+    /// Tracks waiting for a playlist to be picked (or created) for them.
+    pub pending_tracks: Vec<VideoResult>,
+    /// Highlighted row in the "add to which playlist?" dialog. One row past
+    /// the last playlist is the "new playlist" entry.
+    pub pick_selected: usize,
+    pub delete_target: Option<DeleteTarget>,
+
+    /// First visible line of the help overlay. Clamped while rendering,
+    /// which is the only place the viewport height is known.
+    pub help_scroll: u16,
 
     /// Stable clock used only to drive ASCII animation frames (buffering
     /// spinner, playing equalizer) — never reset, just sampled for elapsed time.
@@ -163,6 +221,8 @@ pub struct App {
     /// Set once a "load more" comes back with nothing new: YouTube has no more
     /// results for this query, and asking again just burns a full search.
     search_exhausted: bool,
+
+    rng_state: u64,
 }
 
 /// After this many playback failures in a row, stop auto-advancing and leave
@@ -206,6 +266,14 @@ const META_WINDOW: usize = 6;
 /// hundred rows browsed, on top of everything else the session is holding.
 const MAX_CACHED_THUMBNAILS: usize = 32;
 
+fn seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e37_79b9_7f4a_7c15)
+        | 1
+}
+
 impl App {
     pub fn new(msg_tx: UnboundedSender<AppMessage>, picker: Picker, has_image_support: bool) -> Self {
         // Player spawns its thread immediately and uses msg_tx to report state back.
@@ -213,7 +281,8 @@ impl App {
 
         Self {
             mode: AppMode::Normal,
-            search_input: String::new(),
+            view: View::Search,
+            search: TextInput::default(),
             search_results: Vec::new(),
             selected_index: 0,
             is_searching: false,
@@ -245,10 +314,22 @@ impl App {
             confirm_title: None,
 
             loop_mode: false,
+            shuffle: false,
+            updated_to: None,
             chapters: Vec::new(),
             search_query: String::new(),
             is_loading_more: false,
-            search_cursor: 0,
+
+            library: Library::load(),
+            library_selected: 0,
+            library_track_selected: 0,
+            library_focus: LibraryFocus::Playlists,
+            name_input: TextInput::default(),
+            name_target: None,
+            pending_tracks: Vec::new(),
+            pick_selected: 0,
+            delete_target: None,
+            help_scroll: 0,
 
             started_at: Instant::now(),
             consecutive_failures: 0,
@@ -259,6 +340,7 @@ impl App {
             playlist_announces_count: false,
             thumbnail_order: VecDeque::new(),
             search_exhausted: false,
+            rng_state: seed(),
         }
     }
 
@@ -332,6 +414,62 @@ impl App {
         Ok(())
     }
 
+    fn next_random(&mut self) -> u64 {
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x;
+        x
+    }
+
+    fn random_below(&mut self, len: usize) -> usize {
+        if len <= 1 {
+            return 0;
+        }
+        (self.next_random() % len as u64) as usize
+    }
+
+    fn enqueue(&mut self, video: VideoResult) {
+        if self.shuffle {
+            let at = self.random_below(self.queue.len() + 1);
+            self.queue.insert(at, video);
+        } else {
+            self.queue.push_back(video);
+        }
+    }
+
+    fn enqueue_all(&mut self, videos: impl IntoIterator<Item = VideoResult>) {
+        for video in videos {
+            self.enqueue(video);
+        }
+    }
+
+    fn take_first(&mut self, videos: &mut Vec<VideoResult>) -> Option<VideoResult> {
+        if videos.is_empty() {
+            return None;
+        }
+        let at = if self.shuffle { self.random_below(videos.len()) } else { 0 };
+        Some(videos.remove(at))
+    }
+
+    fn shuffle_queue(&mut self) {
+        for i in (1..self.queue.len()).rev() {
+            let j = self.random_below(i + 1);
+            self.queue.swap(i, j);
+        }
+    }
+
+    fn toggle_shuffle(&mut self) {
+        self.shuffle = !self.shuffle;
+        if self.shuffle {
+            self.shuffle_queue();
+            self.prefetch_next();
+        }
+        let msg = if self.shuffle { "Shuffle ON" } else { "Shuffle OFF" };
+        self.set_status(msg.to_string());
+    }
+
     /// Resolve the next queued track while the current one is still playing,
     /// so advancing the queue costs an mpv startup instead of a fresh
     /// extraction.
@@ -376,6 +514,10 @@ impl App {
                         }
                     }
                     AppMode::Confirming => self.handle_confirm_key(key.code).await?,
+                    AppMode::Naming => self.handle_name_key(key.code),
+                    AppMode::PickingPlaylist => self.handle_pick_key(key.code),
+                    AppMode::ConfirmingDelete => self.handle_delete_key(key.code),
+                    AppMode::Help => self.handle_help_key(key.code),
                 }
             }
             Event::Mouse(MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column, row, .. }) => {
@@ -392,70 +534,40 @@ impl App {
                 self.mode = AppMode::Normal;
             }
             KeyCode::Enter => {
-                if !self.search_input.is_empty() {
+                if !self.search.is_empty() {
+                    self.view = View::Search;
                     self.start_search().await;
                 }
                 self.mode = AppMode::Normal;
             }
-            KeyCode::Backspace => {
-                if self.search_cursor > 0 {
-                    self.search_cursor -= 1;
-                    let byte_pos = self.search_input.char_indices()
-                        .nth(self.search_cursor)
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    self.search_input.remove(byte_pos);
-                }
+            other => {
+                self.search.handle_key(other);
             }
-            KeyCode::Delete => {
-                let len = self.search_input.chars().count();
-                if self.search_cursor < len {
-                    let byte_pos = self.search_input.char_indices()
-                        .nth(self.search_cursor)
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
-                    self.search_input.remove(byte_pos);
-                }
-            }
-            KeyCode::Left => {
-                if self.search_cursor > 0 {
-                    self.search_cursor -= 1;
-                }
-            }
-            KeyCode::Right => {
-                if self.search_cursor < self.search_input.chars().count() {
-                    self.search_cursor += 1;
-                }
-            }
-            KeyCode::Home => {
-                self.search_cursor = 0;
-            }
-            KeyCode::End => {
-                self.search_cursor = self.search_input.chars().count();
-            }
-            KeyCode::Char(c) => {
-                let byte_pos = self.search_input.char_indices()
-                    .nth(self.search_cursor)
-                    .map(|(i, _)| i)
-                    .unwrap_or(self.search_input.len());
-                self.search_input.insert(byte_pos, c);
-                self.search_cursor += 1;
-            }
-            _ => {}
         }
         Ok(())
     }
 
+    /// Returns true when the app should quit.
+    ///
+    /// The keys that act on whatever is on screen (navigating, playing,
+    /// saving) belong to the current view and get first refusal; anything
+    /// they don't claim falls through to the playback keys, which mean the
+    /// same thing wherever you happen to be.
     async fn handle_normal_key(&mut self, key: KeyCode, _mods: KeyModifiers) -> Result<bool> {
+        let claimed = match self.view {
+            View::Search => self.handle_results_key(key).await?,
+            View::Library => self.handle_library_key(key).await?,
+        };
+        if claimed {
+            return Ok(false);
+        }
+        self.handle_global_key(key).await
+    }
+
+    /// Keys that only mean something over the search results. Returns whether
+    /// the key was claimed.
+    async fn handle_results_key(&mut self, key: KeyCode) -> Result<bool> {
         match key {
-            KeyCode::Char('q') => return Ok(true),
-            KeyCode::Char('d') => {
-                self.show_visuals = !self.show_visuals;
-            }
-            KeyCode::Char('/') | KeyCode::Char('s') => {
-                self.mode = AppMode::Searching;
-                self.search_cursor = self.search_input.chars().count();
-            }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.selected_index > 0 {
                     self.selected_index -= 1;
@@ -492,6 +604,59 @@ impl App {
             KeyCode::Char('f') => {
                 self.queue_selected().await?;
             }
+            KeyCode::Char('a') => {
+                self.add_selected_to_playlist();
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Keys that only mean something over the saved playlists. Returns
+    /// whether the key was claimed.
+    async fn handle_library_key(&mut self, key: KeyCode) -> Result<bool> {
+        match key {
+            KeyCode::Esc => self.view = View::Search,
+            KeyCode::Tab | KeyCode::BackTab => self.toggle_library_focus(),
+            KeyCode::Left => self.set_library_focus(LibraryFocus::Playlists),
+            KeyCode::Right => self.set_library_focus(LibraryFocus::Tracks),
+            KeyCode::Up | KeyCode::Char('k') => self.move_library_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_library_selection(1),
+            KeyCode::Char('K') => self.reorder_selected_track(-1),
+            KeyCode::Char('J') => self.reorder_selected_track(1),
+            KeyCode::Enter => self.play_library_selection(true).await?,
+            KeyCode::Char('f') => self.play_library_selection(false).await?,
+            KeyCode::Char('n') => self.prompt_new_playlist(),
+            KeyCode::Char('R') => self.prompt_rename_playlist(),
+            KeyCode::Char('x') => self.prompt_delete(),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Playback and navigation keys, available from either view. Returns true
+    /// when the app should quit.
+    async fn handle_global_key(&mut self, key: KeyCode) -> Result<bool> {
+        match key {
+            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('d') => {
+                self.show_visuals = !self.show_visuals;
+            }
+            KeyCode::Char('/') | KeyCode::Char('s') => {
+                self.view = View::Search;
+                self.mode = AppMode::Searching;
+                self.search.cursor = self.search.len();
+            }
+            KeyCode::Char('p') => {
+                self.toggle_library_view();
+            }
+            KeyCode::Char('?') | KeyCode::F(1) => {
+                self.help_scroll = 0;
+                self.mode = AppMode::Help;
+            }
+            KeyCode::Char('A') => {
+                self.prompt_save_queue();
+            }
             KeyCode::Char(']') => {
                 self.skip_next().await?;
             }
@@ -512,6 +677,9 @@ impl App {
             }
             KeyCode::Char('l') | KeyCode::Right => {
                 self.seek_by(5.0).await?;
+            }
+            KeyCode::Char('z') => {
+                self.toggle_shuffle();
             }
             KeyCode::Char('r') => {
                 self.loop_mode = !self.loop_mode;
@@ -542,7 +710,7 @@ impl App {
         self.thumbnail_order.clear();
         self.search_exhausted = false;
 
-        self.search_query = self.search_input.clone();
+        self.search_query = self.search.value.clone();
         let query = self.search_query.clone();
         let tx = self.msg_tx.clone();
         tokio::spawn(async move {
@@ -768,7 +936,7 @@ impl App {
                     };
                 }
             }
-            AppMessage::PlaylistHead { token, videos, play_immediately } => {
+            AppMessage::PlaylistHead { token, mut videos, play_immediately } => {
                 if token != self.playlist_token {
                     return Ok(()); // a playlist the user has already moved on from
                 }
@@ -782,11 +950,8 @@ impl App {
                         self.history.push(prev);
                     }
                     self.queue.clear();
-                    let mut iter = videos.into_iter();
-                    let first = iter.next();
-                    for video in iter {
-                        self.queue.push_back(video);
-                    }
+                    let first = self.take_first(&mut videos);
+                    self.enqueue_all(videos);
                     if let Some(first) = first {
                         self.consecutive_failures = 0;
                         self.start_track(first).await?;
@@ -794,9 +959,7 @@ impl App {
                 } else {
                     self.playlist_announces_count = true;
                     let start_empty = self.now_playing.is_none() && self.queue.is_empty();
-                    for video in videos {
-                        self.queue.push_back(video);
-                    }
+                    self.enqueue_all(videos);
                     // Nothing was playing, so the queue alone would just sit
                     // there — start it on the first track that arrived.
                     if start_empty {
@@ -813,9 +976,7 @@ impl App {
                     return Ok(());
                 }
                 let queue_was_empty = self.queue.is_empty();
-                for video in videos {
-                    self.queue.push_back(video);
-                }
+                self.enqueue_all(videos);
                 // The head was short enough that `start_track` found nothing to
                 // resolve ahead; now there is.
                 if queue_was_empty {
@@ -839,6 +1000,10 @@ impl App {
                 self.search_exhausted = new_results.is_empty();
                 self.search_results.extend(new_results);
                 self.request_playlist_meta();
+            }
+            AppMessage::Updated(version) => {
+                self.set_status(format!("Updated to v{version} — restart to run it"));
+                self.updated_to = Some(version);
             }
             AppMessage::PlaylistMetaLoaded { id, meta } => {
                 if let Some(r) = self.search_results.iter_mut().find(|r| r.id == id) {
@@ -1085,7 +1250,7 @@ impl App {
                 self.start_track(result).await?;
             } else {
                 let title = result.title.clone();
-                self.queue.push_back(result);
+                self.enqueue(result);
                 self.set_status(format!(
                     "Added to queue ({} tracks): {}",
                     self.queue.len(),
@@ -1095,6 +1260,399 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    // ── Saved playlists ──────────────────────────────────────────────────
+
+    pub fn selected_playlist(&self) -> Option<&SavedPlaylist> {
+        self.library.playlists.get(self.library_selected)
+    }
+
+    /// Names of the saved playlists a video is already in, so the preview can
+    /// say so instead of letting someone add the same track twice.
+    pub fn playlists_with(&self, video_id: &str) -> Vec<&str> {
+        self.library
+            .playlists
+            .iter()
+            .filter(|p| p.contains(video_id))
+            .map(|p| p.name.as_str())
+            .collect()
+    }
+
+    fn toggle_library_view(&mut self) {
+        self.view = match self.view {
+            View::Search => View::Library,
+            View::Library => View::Search,
+        };
+        if self.view == View::Library {
+            self.library_focus = LibraryFocus::Playlists;
+            self.clamp_library_selection();
+        }
+    }
+
+    fn set_library_focus(&mut self, focus: LibraryFocus) {
+        self.library_focus = focus;
+        self.clamp_library_selection();
+    }
+
+    fn toggle_library_focus(&mut self) {
+        let next = match self.library_focus {
+            LibraryFocus::Playlists => LibraryFocus::Tracks,
+            LibraryFocus::Tracks => LibraryFocus::Playlists,
+        };
+        self.set_library_focus(next);
+    }
+
+    /// Keep both library cursors pointing at something that exists. Called
+    /// after anything that can shorten a list — deleting, removing a track,
+    /// or moving between playlists of different lengths.
+    fn clamp_library_selection(&mut self) {
+        let playlists = self.library.playlists.len();
+        self.library_selected = self.library_selected.min(playlists.saturating_sub(1));
+        let tracks = self.selected_playlist().map(|p| p.tracks.len()).unwrap_or(0);
+        self.library_track_selected = self.library_track_selected.min(tracks.saturating_sub(1));
+        // Nothing to point at on the right, so the focus can't live there.
+        if tracks == 0 {
+            self.library_focus = LibraryFocus::Playlists;
+        }
+    }
+
+    fn move_library_selection(&mut self, delta: isize) {
+        let count = match self.library_focus {
+            LibraryFocus::Playlists => self.library.playlists.len(),
+            LibraryFocus::Tracks => self.selected_playlist().map(|p| p.tracks.len()).unwrap_or(0),
+        };
+        if count == 0 {
+            return;
+        }
+        let current = match self.library_focus {
+            LibraryFocus::Playlists => self.library_selected,
+            LibraryFocus::Tracks => self.library_track_selected,
+        };
+        let next = (current as isize + delta).clamp(0, count as isize - 1) as usize;
+        match self.library_focus {
+            LibraryFocus::Playlists => {
+                if next != self.library_selected {
+                    self.library_selected = next;
+                    // A different playlist entirely: start at its top rather
+                    // than wherever the previous one happened to be scrolled.
+                    self.library_track_selected = 0;
+                }
+            }
+            LibraryFocus::Tracks => self.library_track_selected = next,
+        }
+    }
+
+    fn reorder_selected_track(&mut self, delta: isize) {
+        if self.library_focus != LibraryFocus::Tracks {
+            return;
+        }
+        let moved = self
+            .library
+            .move_track(self.library_selected, self.library_track_selected, delta);
+        if moved != self.library_track_selected {
+            self.library_track_selected = moved;
+            self.persist();
+        }
+    }
+
+    /// Play (or queue) the highlighted playlist.
+    ///
+    /// With the focus on a track, the playlist starts from that track rather
+    /// than the top — playing a playlist from the middle is the normal way to
+    /// use one — and queueing takes just that track.
+    async fn play_library_selection(&mut self, replace: bool) -> Result<()> {
+        let Some(playlist) = self.selected_playlist() else {
+            self.set_error("No saved playlists yet — press [n] to make one.");
+            return Ok(());
+        };
+        let name = playlist.name.clone();
+        let mut tracks = self.library.tracks_of(self.library_selected);
+
+        if self.library_focus == LibraryFocus::Tracks
+            && self.library_track_selected < tracks.len()
+        {
+            if replace {
+                tracks.drain(..self.library_track_selected);
+            } else {
+                tracks = vec![tracks.remove(self.library_track_selected)];
+            }
+        }
+
+        if tracks.is_empty() {
+            self.set_error(format!(
+                "\"{name}\" is empty — add tracks with [a] from the search results."
+            ));
+            return Ok(());
+        }
+
+        // A YouTube playlist may still be streaming into the queue; stamp its
+        // token spent so the tail doesn't land behind what we start here.
+        self.playlist_token = self.playlist_token.wrapping_add(1);
+        let count = tracks.len();
+
+        if replace {
+            if let Some(prev) = self.now_playing.take() {
+                self.history.push(prev);
+            }
+            self.queue.clear();
+            self.consecutive_failures = 0;
+            let first = self
+                .take_first(&mut tracks)
+                .expect("checked non-empty just above");
+            self.enqueue_all(tracks);
+            self.start_track(first).await?;
+            self.set_status(format!("Playing \"{name}\" ({count} tracks)"));
+        } else {
+            let start_now = self.now_playing.is_none();
+            self.enqueue_all(tracks);
+            if start_now {
+                if let Some(first) = self.queue.pop_front() {
+                    self.consecutive_failures = 0;
+                    self.start_track(first).await?;
+                }
+            }
+            self.prefetch_next();
+            self.set_status(format!("Queued {count} track(s) from \"{name}\""));
+        }
+        Ok(())
+    }
+
+    /// Offer to save the highlighted search result to a playlist.
+    fn add_selected_to_playlist(&mut self) {
+        let Some(result) = self.search_results.get(self.selected_index).cloned() else {
+            return;
+        };
+        if result.is_playlist {
+            // A playlist row is an id, not tracks — they only exist here once
+            // yt-dlp has walked it, which queueing already does.
+            self.set_error(
+                "That's a YouTube playlist — queue it with [f], then press [A] to save the queue.",
+            );
+            return;
+        }
+        self.offer_playlists(vec![result]);
+    }
+
+    /// Save what is playing plus everything queued behind it as a playlist.
+    /// This is also how a YouTube playlist becomes a local one.
+    fn prompt_save_queue(&mut self) {
+        let tracks: Vec<VideoResult> = self
+            .now_playing
+            .iter()
+            .chain(self.queue.iter())
+            .cloned()
+            .collect();
+        if tracks.is_empty() {
+            self.set_error("Nothing playing or queued to save.");
+            return;
+        }
+        // Straight to naming rather than the picker: a whole queue is a new
+        // playlist, not a handful of tracks to fold into an existing one.
+        self.pending_tracks = tracks;
+        self.begin_naming(NameTarget::Create, String::new());
+    }
+
+    /// Ask which playlist the pending tracks belong in — unless there are no
+    /// playlists yet, in which case the only useful answer is a new one.
+    fn offer_playlists(&mut self, tracks: Vec<VideoResult>) {
+        self.pending_tracks = tracks;
+        if self.library.playlists.is_empty() {
+            self.begin_naming(NameTarget::Create, String::new());
+        } else {
+            self.pick_selected = self.library_selected.min(self.library.playlists.len() - 1);
+            self.mode = AppMode::PickingPlaylist;
+        }
+    }
+
+    fn prompt_new_playlist(&mut self) {
+        self.pending_tracks.clear();
+        self.begin_naming(NameTarget::Create, String::new());
+    }
+
+    fn prompt_rename_playlist(&mut self) {
+        let Some(playlist) = self.selected_playlist() else {
+            return;
+        };
+        let name = playlist.name.clone();
+        self.begin_naming(NameTarget::Rename(self.library_selected), name);
+    }
+
+    fn begin_naming(&mut self, target: NameTarget, initial: String) {
+        self.name_input = TextInput::with_value(initial);
+        self.name_target = Some(target);
+        self.mode = AppMode::Naming;
+    }
+
+    fn handle_name_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => {
+                self.mode = AppMode::Normal;
+                self.name_target = None;
+                self.pending_tracks.clear();
+            }
+            KeyCode::Enter => {
+                // A nameless playlist is unusable in a list of names, so an
+                // empty prompt simply doesn't submit.
+                if self.name_input.is_empty() {
+                    return;
+                }
+                let name = self.name_input.value.trim().to_string();
+                match self.name_target.take() {
+                    Some(NameTarget::Create) => {
+                        let index = self.library.create(&name);
+                        let added = self.add_pending_to(index);
+                        self.library_selected = index;
+                        self.library_track_selected = 0;
+                        self.persist();
+                        let created = self.library.playlists[index].name.clone();
+                        if added > 0 {
+                            self.set_status(format!("Saved {added} track(s) to \"{created}\""));
+                        } else {
+                            self.set_status(format!("Created playlist \"{created}\""));
+                        }
+                    }
+                    Some(NameTarget::Rename(index)) => {
+                        self.library.rename(index, &name);
+                        self.persist();
+                        if let Some(playlist) = self.library.playlists.get(index) {
+                            self.set_status(format!("Renamed to \"{}\"", playlist.name));
+                        }
+                    }
+                    None => {}
+                }
+                self.mode = AppMode::Normal;
+            }
+            other => {
+                self.name_input.handle_key(other);
+            }
+        }
+    }
+
+    fn handle_pick_key(&mut self, key: KeyCode) {
+        let count = self.library.playlists.len();
+        match key {
+            KeyCode::Esc => {
+                self.mode = AppMode::Normal;
+                self.pending_tracks.clear();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.pick_selected = self.pick_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                // `count` itself is the "new playlist" row at the bottom.
+                self.pick_selected = (self.pick_selected + 1).min(count);
+            }
+            KeyCode::Char('n') => {
+                self.begin_naming(NameTarget::Create, String::new());
+            }
+            KeyCode::Enter => {
+                if self.pick_selected >= count {
+                    self.begin_naming(NameTarget::Create, String::new());
+                    return;
+                }
+                let index = self.pick_selected;
+                let added = self.add_pending_to(index);
+                self.persist();
+                let playlist = &self.library.playlists[index];
+                let (name, total) = (playlist.name.clone(), playlist.tracks.len());
+                if added > 0 {
+                    self.set_status(format!("Added to \"{name}\" ({total} tracks)"));
+                } else {
+                    self.set_status(format!("Already in \"{name}\""));
+                }
+                self.mode = AppMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    /// Move whatever is waiting in `pending_tracks` into playlist `index`,
+    /// returning how many of them were actually new to it.
+    fn add_pending_to(&mut self, index: usize) -> usize {
+        let tracks = std::mem::take(&mut self.pending_tracks);
+        tracks
+            .iter()
+            .filter(|track| self.library.add_track(index, track))
+            .count()
+    }
+
+    fn prompt_delete(&mut self) {
+        let target = match self.library_focus {
+            LibraryFocus::Playlists => self
+                .selected_playlist()
+                .map(|_| DeleteTarget::Playlist(self.library_selected)),
+            LibraryFocus::Tracks => self
+                .selected_playlist()
+                .filter(|p| self.library_track_selected < p.tracks.len())
+                .map(|_| DeleteTarget::Track(self.library_selected, self.library_track_selected)),
+        };
+        if target.is_some() {
+            self.delete_target = target;
+            self.mode = AppMode::ConfirmingDelete;
+        }
+    }
+
+    fn handle_delete_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                match self.delete_target.take() {
+                    Some(DeleteTarget::Playlist(index)) => {
+                        if let Some(removed) = self.library.remove(index) {
+                            self.persist();
+                            self.set_status(format!("Deleted playlist \"{}\"", removed.name));
+                        }
+                    }
+                    Some(DeleteTarget::Track(index, track)) => {
+                        self.library.remove_track(index, track);
+                        self.persist();
+                        self.set_status("Removed track from playlist".to_string());
+                    }
+                    None => {}
+                }
+                self.clamp_library_selection();
+                self.mode = AppMode::Normal;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.delete_target = None;
+                self.mode = AppMode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    /// Scroll the help overlay, or close it.
+    ///
+    /// Anything that isn't a scroll closes it — someone who opened the
+    /// reference by accident shouldn't have to work out how to leave, and
+    /// there is nothing in here a stray key could damage.
+    fn handle_help_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.help_scroll = self.help_scroll.saturating_add(1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.help_scroll = self.help_scroll.saturating_sub(1)
+            }
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                self.help_scroll = self.help_scroll.saturating_add(10)
+            }
+            KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+            KeyCode::Home => self.help_scroll = 0,
+            // Past the end; the render clamps it to the real last line.
+            KeyCode::End => self.help_scroll = u16::MAX,
+            _ => self.mode = AppMode::Normal,
+        }
+    }
+
+    /// Write the library out, surfacing a failure rather than losing the
+    /// change quietly — the whole point of a saved playlist is that it is
+    /// still there next time.
+    fn persist(&mut self) {
+        if let Err(e) = self.library.save() {
+            crate::logline!("library: save failed: {e}");
+            self.set_error(format!("Could not save playlists: {e}"));
+        }
     }
 
     async fn toggle_pause(&mut self) -> Result<()> {
@@ -1229,7 +1787,212 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         // Keep the receiver alive; dropping it makes every send fail.
         std::mem::forget(rx);
-        App::new(tx, Picker::from_fontsize((8, 12)), false)
+        let mut app = App::new(tx, Picker::from_fontsize((8, 12)), false);
+        // `App::new` loads the real user library; point every test at a
+        // scratch file of its own so saving can never reach someone's
+        // actual playlists, and two tests can't fight over one file.
+        app.library = Library::at(scratch_library());
+        app
+    }
+
+    fn scratch_library() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("listen_to_it_test_app_{}_{n}.json", std::process::id()))
+    }
+
+    fn key(c: char) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    fn press(code: KeyCode) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    async fn type_name(app: &mut App, name: &str) {
+        for c in name.chars() {
+            app.handle_event(key(c)).await.unwrap();
+        }
+        app.handle_event(press(KeyCode::Enter)).await.unwrap();
+    }
+
+    /// The headline flow: pick a video out of the search results, name a
+    /// playlist for it, and find the track in it afterwards.
+    #[tokio::test]
+    async fn a_search_result_is_saved_into_a_named_playlist() {
+        let mut app = app();
+        app.search_results = vec![track(1), track(2)];
+        app.selected_index = 1;
+
+        app.handle_event(key('a')).await.unwrap();
+        // Nothing to choose between yet, so it goes straight to naming.
+        assert!(app.mode == AppMode::Naming);
+
+        type_name(&mut app, "Road trip").await;
+
+        assert!(app.mode == AppMode::Normal);
+        assert_eq!(app.library.playlists.len(), 1);
+        assert_eq!(app.library.playlists[0].name, "Road trip");
+        let ids: Vec<&str> =
+            app.library.playlists[0].tracks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["v2"], "the highlighted row is the one that gets saved");
+    }
+
+    /// With playlists already there, the track has to land in the one the
+    /// user picks rather than the first or the last.
+    #[tokio::test]
+    async fn a_track_lands_in_the_chosen_playlist() {
+        let mut app = app();
+        app.library.create("Focus");
+        app.library.create("Gym");
+        app.search_results = vec![track(7)];
+
+        app.handle_event(key('a')).await.unwrap();
+        assert!(app.mode == AppMode::PickingPlaylist);
+        app.handle_event(key('j')).await.unwrap(); // down to "Gym"
+        app.handle_event(press(KeyCode::Enter)).await.unwrap();
+
+        assert!(app.library.playlists[0].tracks.is_empty());
+        assert_eq!(app.library.playlists[1].tracks.len(), 1);
+        assert!(app.mode == AppMode::Normal);
+    }
+
+    /// A saved playlist plays without going back to YouTube for anything: the
+    /// first track starts and the rest are queued in order behind it.
+    #[tokio::test]
+    async fn a_saved_playlist_plays_in_order() {
+        let mut app = app();
+        let idx = app.library.create("Focus");
+        for i in 1..=3 {
+            app.library.add_track(idx, &track(i));
+        }
+        app.view = View::Library;
+
+        app.handle_event(press(KeyCode::Enter)).await.unwrap();
+
+        assert_eq!(app.now_playing.as_ref().unwrap().id, "v1");
+        let queued: Vec<&str> = app.queue.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(queued, ["v2", "v3"]);
+    }
+
+    /// Playing a playlist from the middle is the normal way to use one, so
+    /// Enter over a track starts there rather than at the top.
+    #[tokio::test]
+    async fn enter_on_a_track_starts_the_playlist_there() {
+        let mut app = app();
+        let idx = app.library.create("Focus");
+        for i in 1..=3 {
+            app.library.add_track(idx, &track(i));
+        }
+        app.view = View::Library;
+        app.library_focus = LibraryFocus::Tracks;
+        app.library_track_selected = 1;
+
+        app.handle_event(press(KeyCode::Enter)).await.unwrap();
+
+        assert_eq!(app.now_playing.as_ref().unwrap().id, "v2");
+        let queued: Vec<&str> = app.queue.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(queued, ["v3"], "the tracks before the one picked are skipped, not queued");
+    }
+
+    /// Whatever is playing leads the playlist the queue is saved into —
+    /// this is also how a YouTube playlist becomes a local one.
+    #[tokio::test]
+    async fn the_queue_can_be_saved_as_a_playlist() {
+        let mut app = app();
+        app.now_playing = Some(track(1));
+        app.queue.push_back(track(2));
+        app.queue.push_back(track(3));
+
+        app.handle_event(key('A')).await.unwrap();
+        assert!(app.mode == AppMode::Naming);
+        type_name(&mut app, "Set").await;
+
+        let ids: Vec<&str> =
+            app.library.playlists[0].tracks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["v1", "v2", "v3"]);
+    }
+
+    /// Deleting shortens the lists the two cursors point into; neither may be
+    /// left hanging past the end, and the focus can't stay on a pane that no
+    /// longer has anything in it.
+    #[tokio::test]
+    async fn deleting_leaves_both_cursors_valid() {
+        let mut app = app();
+        app.library.create("one");
+        let idx = app.library.create("two");
+        app.library.add_track(idx, &track(1));
+
+        app.view = View::Library;
+        app.library_selected = 1;
+        app.library_focus = LibraryFocus::Tracks;
+
+        app.handle_event(key('x')).await.unwrap();
+        app.handle_event(key('y')).await.unwrap();
+        assert!(app.library.playlists[1].tracks.is_empty());
+        assert!(
+            app.library_focus == LibraryFocus::Playlists,
+            "the focus cannot stay on an empty track list"
+        );
+
+        app.handle_event(key('x')).await.unwrap();
+        app.handle_event(key('y')).await.unwrap();
+        assert_eq!(app.library.playlists.len(), 1);
+        assert_eq!(app.library_selected, 0, "the cursor must not point past the end");
+    }
+
+    /// A playlist name is typed into the same kind of field as a search, so
+    /// the two must not bleed into each other.
+    #[tokio::test]
+    async fn naming_a_playlist_does_not_disturb_the_search_box() {
+        let mut app = app();
+        app.search.value = "miles davis".to_string();
+        app.search.cursor = app.search.len();
+        app.view = View::Library;
+
+        app.handle_event(key('n')).await.unwrap();
+        type_name(&mut app, "Jazz").await;
+
+        assert_eq!(app.search.value, "miles davis");
+        assert_eq!(app.library.playlists[0].name, "Jazz");
+    }
+
+    /// The help overlay is a reference, not a mode to get stuck in: it opens
+    /// from either view, and anything that isn't a scroll leaves it again.
+    #[tokio::test]
+    async fn help_opens_anywhere_and_closes_on_any_key() {
+        let mut app = app();
+
+        app.handle_event(key('?')).await.unwrap();
+        assert!(app.mode == AppMode::Help);
+
+        // 'q' quits from normal mode; over the help it only closes the help.
+        let quit = app.handle_event(key('q')).await.unwrap();
+        assert!(!quit, "a key pressed over the help must not quit the app");
+        assert!(app.mode == AppMode::Normal);
+
+        app.view = View::Library;
+        app.handle_event(press(KeyCode::F(1))).await.unwrap();
+        assert!(app.mode == AppMode::Help, "the help is reachable from the playlists too");
+    }
+
+    /// The top of the help is clamped here; the bottom is clamped by the
+    /// render, which is the only place that knows how many lines fit.
+    #[tokio::test]
+    async fn help_scrolling_stops_at_the_top() {
+        let mut app = app();
+        app.handle_event(key('?')).await.unwrap();
+
+        app.handle_event(key('k')).await.unwrap();
+        assert_eq!(app.help_scroll, 0, "already at the first line");
+
+        app.handle_event(key('j')).await.unwrap();
+        assert_eq!(app.help_scroll, 1);
+        assert!(app.mode == AppMode::Help, "scrolling doesn't close it");
+
+        app.handle_event(press(KeyCode::Home)).await.unwrap();
+        assert_eq!(app.help_scroll, 0);
     }
 
     /// A playlist arrives in pieces, so the tail has to land behind the head in

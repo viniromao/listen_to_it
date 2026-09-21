@@ -63,7 +63,7 @@ pub fn path() -> &'static Path {
         .as_path()
 }
 
-fn cache_dir() -> Result<PathBuf> {
+pub(crate) fn cache_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let dir = PathBuf::from(home).join(".cache").join("listen_to_it");
     std::fs::create_dir_all(&dir)?;

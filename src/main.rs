@@ -13,12 +13,15 @@ use tokio::sync::mpsc;
 use tokio::time::Duration;
 
 mod app;
+mod input;
+mod library;
 #[macro_use]
 mod logging;
 mod player;
 mod stream;
 mod thumbnail;
 mod ui;
+mod update;
 mod youtube;
 mod ytdlp;
 
@@ -84,6 +87,8 @@ async fn main() -> Result<()> {
 
     // App creates its own player thread inside new().
     let mut app = App::new(msg_tx.clone(), picker, has_image_support);
+
+    update::start(msg_tx.clone());
 
     // ── Media controls (MPRIS2 / Now Playing) ────────────────────────────────
     let (media_tx, mut media_rx) = mpsc::unbounded_channel::<MediaAction>();
