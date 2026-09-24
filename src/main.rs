@@ -10,7 +10,6 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use souvlaki::{MediaControlEvent, MediaControls, PlatformConfig};
 use std::io;
 use tokio::sync::mpsc;
-use tokio::time::Duration;
 
 mod app;
 mod input;
@@ -18,6 +17,7 @@ mod library;
 #[macro_use]
 mod logging;
 mod player;
+mod spectrum;
 mod stream;
 mod thumbnail;
 mod ui;
@@ -150,9 +150,10 @@ async fn main() -> Result<()> {
         }
 
         // ── Render ──────────────────────────────────────────────────────────
+        app.animate();
         terminal.draw(|frame| ui::render(frame, &mut app))?;
 
-        // ── Wait for next event (100 ms timeout keeps the clock updating) ───
+        // ── Wait for next event (the timeout keeps the clock and bars moving) ─
         tokio::select! {
             biased;
             Some(event) = ev_rx.recv() => {
@@ -160,7 +161,7 @@ async fn main() -> Result<()> {
             }
             Some(msg) = msg_rx.recv() => { app.handle_message(msg).await?; }
             Some(action) = media_rx.recv() => { app.handle_media_action(action).await?; }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            _ = tokio::time::sleep(app.frame_interval()) => {}
         }
     }
 

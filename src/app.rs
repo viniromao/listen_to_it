@@ -20,6 +20,9 @@ pub enum AppMessage {
     SearchError(String),
     ThumbnailLoaded { video_id: String, image: DynamicImage },
     ThumbnailFailed(String),
+    /// Artwork for the track in the now-playing bar, fetched separately from
+    /// the preview cache so a new search or eviction never takes it away.
+    NowPlayingThumbnail { video_id: String, image: DynamicImage },
     /// Audio thread started downloading
     AudioLoading,
     /// Audio thread finished buffering and started playback
@@ -30,6 +33,12 @@ pub enum AppMessage {
     AudioFinished,
     /// Real playback position (seconds) reported by mpv via IPC
     Position(f64),
+    /// Loudness of what mpv is playing, RMS in dBFS
+    AudioLevel(f64),
+    /// mpv's `core-idle`: true while no audio is coming out even though a
+    /// track is loaded (opening the stream, stalled waiting on the network,
+    /// paused).
+    AudioIdle(bool),
     /// A track requested for playback has been resolved to a playable stream.
     StreamReady { watch_url: String, stream: Arc<crate::stream::Stream> },
     /// Resolving a track requested for playback failed.
@@ -135,6 +144,11 @@ pub struct App {
     pub thumbnails_failed: HashSet<String>,
     /// Playlist ids whose metadata has already been requested, to fetch once.
     pub playlist_meta_requested: HashSet<String>,
+    /// The now-playing track's artwork, keyed by video id. Its own protocol
+    /// rather than a shared one from `thumbnail_protocols`: the bar and the
+    /// preview draw at different sizes, and one protocol drawn at two sizes
+    /// re-encodes the image on every frame.
+    pub now_playing_thumb: Option<(String, StatefulProtocol)>,
     pub picker: Picker,
 
     pub msg_tx: UnboundedSender<AppMessage>,
@@ -144,6 +158,10 @@ pub struct App {
     pub media_controls: Option<MediaControls>,
 
     pub show_visuals: bool,
+    pub spectrum: crate::spectrum::Spectrum,
+    /// Last `AudioIdle` from mpv. Starts true for each track, so the bars stay
+    /// down until mpv says sound is actually coming out.
+    pub audio_idle: bool,
     pub progress_bar_area: Option<Rect>,
     // Title of the track pending confirmation before playing.
     pub confirm_title: Option<String>,
@@ -303,6 +321,7 @@ impl App {
             thumbnails_loading: HashSet::new(),
             thumbnails_failed: HashSet::new(),
             playlist_meta_requested: HashSet::new(),
+            now_playing_thumb: None,
             picker,
 
             msg_tx,
@@ -310,6 +329,8 @@ impl App {
             media_controls: None,
 
             show_visuals: true,
+            spectrum: crate::spectrum::Spectrum::new(),
+            audio_idle: true,
             progress_bar_area: None,
             confirm_title: None,
 
@@ -370,10 +391,34 @@ impl App {
         self.now_playing.is_some() && self.play_start.is_none() && !self.is_paused
     }
 
+    /// Whether audio is actually coming out right now. `is_buffering` alone
+    /// isn't enough: while mpv opens or stalls on a stream it still answers
+    /// with a (stuck) position, which looks like playback to the local clock.
+    fn is_audible(&self) -> bool {
+        self.now_playing.is_some() && !self.is_paused && !self.is_buffering() && !self.audio_idle
+    }
+
+    /// Advance anything that animates on its own between events.
+    pub fn animate(&mut self) {
+        self.spectrum.step(self.is_audible());
+    }
+
+    /// How long the main loop may sleep before the next frame is due. The
+    /// spectrum bars need a smoother frame rate than the clock does.
+    pub fn frame_interval(&self) -> Duration {
+        if self.show_visuals && self.spectrum.is_moving(self.is_audible()) {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(100)
+        }
+    }
+
     /// Make `track` the current track and start it playing.
     async fn start_track(&mut self, track: VideoResult) -> Result<()> {
         let url = track.watch_url();
         self.now_playing = Some(track);
+        self.request_now_playing_thumbnail();
+        self.audio_idle = true;
         self.is_paused = false;
         self.play_start = None; // anchored once mpv reports a real Position
         self.paused_elapsed = 0.0;
@@ -725,6 +770,26 @@ impl App {
         });
     }
 
+    /// Fetch artwork for the now-playing bar, unless it already shows this
+    /// track (a retry of the same song keeps what it has).
+    fn request_now_playing_thumbnail(&mut self) {
+        let Some(track) = &self.now_playing else { return };
+        if !self.has_image_support
+            || self.now_playing_thumb.as_ref().is_some_and(|(id, _)| *id == track.id)
+        {
+            return;
+        }
+        self.now_playing_thumb = None;
+        let tx = self.msg_tx.clone();
+        let video_id = track.id.clone();
+        let url = track.thumbnail_url();
+        tokio::spawn(async move {
+            if let Ok(image) = crate::thumbnail::fetch(&url).await {
+                let _ = tx.send(AppMessage::NowPlayingThumbnail { video_id, image });
+            }
+        });
+    }
+
     fn request_thumbnail_for(&mut self, video_id: &str, url: &str) {
         if !self.has_image_support
             || self.thumbnail_protocols.contains_key(video_id)
@@ -861,6 +926,14 @@ impl App {
                 self.thumbnails_loading.remove(&video_id);
                 self.thumbnails_failed.insert(video_id);
             }
+            AppMessage::NowPlayingThumbnail { video_id, image } => {
+                // The track may have changed while this was in flight.
+                if self.now_playing.as_ref().is_some_and(|t| t.id == video_id) {
+                    let image = crate::thumbnail::crop_letterbox(image);
+                    let protocol = self.picker.new_resize_protocol(image);
+                    self.now_playing_thumb = Some((video_id, protocol));
+                }
+            }
             AppMessage::AudioLoading => {
                 self.set_status("Buffering audio...".to_string());
             }
@@ -909,6 +982,12 @@ impl App {
                         self.update_media_controls();
                     }
                 }
+            }
+            AppMessage::AudioIdle(idle) => {
+                self.audio_idle = idle;
+            }
+            AppMessage::AudioLevel(db) => {
+                self.spectrum.set_level_db(db);
             }
             AppMessage::Position(pos) => {
                 // Re-anchor the local clock to mpv's real position. This keeps
@@ -1064,6 +1143,7 @@ impl App {
                 tokio::time::sleep(RETRY_DELAY).await;
                 let url = track.watch_url();
                 self.now_playing = Some(track);
+                self.audio_idle = true;
                 self.paused_elapsed = 0.0;
                 self.begin_stream(&url).await?;
                 self.update_media_controls();
@@ -2069,6 +2149,23 @@ mod tests {
 
     /// Once YouTube has no more results, asking again costs a full re-search
     /// and returns nothing — it must not be retried on every keypress.
+    /// While mpv opens or stalls on a stream it still reports a position,
+    /// which used to make the bars twitch between playing and not. They
+    /// follow mpv's own idea of whether sound is coming out instead.
+    #[tokio::test]
+    async fn the_bars_wait_for_mpv_to_actually_play() {
+        let mut app = app();
+        app.now_playing = Some(track(1));
+        app.handle_message(AppMessage::Position(0.0)).await.unwrap();
+        assert!(!app.is_audible(), "a position alone isn't sound");
+
+        app.handle_message(AppMessage::AudioIdle(false)).await.unwrap();
+        assert!(app.is_audible());
+
+        app.handle_message(AppMessage::AudioIdle(true)).await.unwrap();
+        assert!(!app.is_audible(), "a stall silences the bars");
+    }
+
     #[tokio::test]
     async fn exhausted_search_stops_reloading() {
         let mut app = app();

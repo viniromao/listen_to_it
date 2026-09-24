@@ -12,6 +12,9 @@ use crate::app::AppMessage;
 
 const SOCKET_PATH: &str = "/tmp/listen_to_it_mpv.sock";
 
+/// Label of the loudness-measuring filter, which names its metadata property.
+const LEVEL_FILTER: &str = "level";
+
 enum PlayerCmd {
     Play(PlayRequest),
     TogglePause,
@@ -122,6 +125,15 @@ impl MpvProcess {
             // the ~2.5 s of startup latency resolving it ourselves avoids.
             "--no-ytdl",
             &format!("--input-ipc-server={SOCKET_PATH}"),
+            // Measure how loud the track is, for the spectrum bars. Appended so
+            // any filters in the user's mpv.conf still apply. It sits in
+            // the filter chain ahead of mpv's own volume, so it reads the
+            // music itself: a quiet passage reads quiet whatever the volume
+            // is set to. Stats reset every 4 frames (~85 ms at 48 kHz), about
+            // one poll's worth.
+            &format!(
+                "--af-append=@{LEVEL_FILTER}:lavfi=[astats=metadata=1:reset=4:measure_perchannel=none:measure_overall=RMS_level]"
+            ),
         ]);
 
         // Replay the headers yt-dlp used. The User-Agent has its own option;
@@ -198,6 +210,21 @@ fn ipc_send(cmd: serde_json::Value) -> Result<()> {
 /// return its value. Returns `None` if mpv is unreachable or the property is
 /// currently unavailable (e.g. before playback has actually started).
 fn ipc_query_f64(prop: &str) -> Option<f64> {
+    ipc_query(prop)?.as_f64()
+}
+
+/// Loudness of the audio mpv is playing right now, as RMS in dBFS
+/// (`-inf` for silence), from the filter set up in [`MpvProcess::spawn`].
+fn query_level() -> Option<f64> {
+    let data = ipc_query(&format!("af-metadata/{LEVEL_FILTER}"))?;
+    parse_level(&data)
+}
+
+fn parse_level(data: &serde_json::Value) -> Option<f64> {
+    data.get("lavfi.astats.Overall.RMS_level")?.as_str()?.parse().ok()
+}
+
+fn ipc_query(prop: &str) -> Option<serde_json::Value> {
     let stream = UnixStream::connect(SOCKET_PATH).ok()?;
     // Never block the player loop for long if mpv is unresponsive.
     stream
@@ -215,7 +242,7 @@ fn ipc_query_f64(prop: &str) -> Option<f64> {
         let line = line.ok()?;
         let v: serde_json::Value = serde_json::from_str(&line).ok()?;
         if v.get("request_id").and_then(|r| r.as_i64()) == Some(1) {
-            return v.get("data").and_then(|d| d.as_f64());
+            return v.get("data").cloned();
         }
     }
     None
@@ -237,7 +264,8 @@ fn player_thread(rx: mpsc::Receiver<PlayerCmd>, event_tx: UnboundedSender<AppMes
     let mut volume: i32 = 100;
 
     loop {
-        match rx.recv_timeout(Duration::from_millis(200)) {
+        // 100 ms keeps the loudness readings fresh enough for the bars.
+        match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(cmd) => match cmd {
                 PlayerCmd::Play(req) => {
                     crate::logline!("player: Play({})", req.url);
@@ -334,6 +362,12 @@ fn player_thread(rx: mpsc::Receiver<PlayerCmd>, event_tx: UnboundedSender<AppMes
                             if let Some(pos) = ipc_query_f64("time-pos") {
                                 let _ = event_tx.send(AppMessage::Position(pos));
                             }
+                            if let Some(idle) = ipc_query("core-idle").and_then(|v| v.as_bool()) {
+                                let _ = event_tx.send(AppMessage::AudioIdle(idle));
+                            }
+                            if let Some(db) = query_level() {
+                                let _ = event_tx.send(AppMessage::AudioLevel(db));
+                            }
                         }
                         Err(_) => {}
                     }
@@ -350,10 +384,19 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    #[test]
+    fn reads_the_level_mpv_reports() {
+        let data = json!({"lavfi.astats.Overall.RMS_level": "-9.030004"});
+        assert_eq!(parse_level(&data), Some(-9.030004));
+        let silence = json!({"lavfi.astats.Overall.RMS_level": "-inf"});
+        assert_eq!(parse_level(&silence), Some(f64::NEG_INFINITY));
+        assert_eq!(parse_level(&json!({})), None);
+    }
+
     /// End-to-end through a real mpv: resolve a track, hand the player the
-    /// stream, and check mpv actually opens it and reports positions — which
-    /// is what proves the direct URL, `--no-ytdl` and the replayed request
-    /// headers all hold together. Hits the network, so it's opt-in:
+    /// stream, and check mpv actually opens it and reports positions and
+    /// loudness — which is what proves the direct URL, `--no-ytdl`, the
+    /// replayed request headers and the level filter all hold together. Hits the network, so it's opt-in:
     /// `cargo test -- --ignored --nocapture`.
     #[tokio::test]
     #[ignore = "requires network, yt-dlp and mpv"]
@@ -365,7 +408,7 @@ mod tests {
         std::env::set_var("MPV_HOME", &mpv_home);
 
         crate::ytdlp::ensure().await.unwrap();
-        let stream = crate::stream::resolve("https://www.youtube.com/watch?v=NolF1yCK33c")
+        let stream = crate::stream::resolve("https://www.youtube.com/watch?v=jNQXAC9IVRw")
             .await
             .unwrap();
 
@@ -376,10 +419,12 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut ready = false;
         let mut position = None;
-        while Instant::now() < deadline && position.is_none() {
+        let mut level = None;
+        while Instant::now() < deadline && (position.is_none() || level.is_none()) {
             match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
                 Ok(Some(AppMessage::AudioReady)) => ready = true,
                 Ok(Some(AppMessage::Position(p))) if p > 0.0 => position = Some(p),
+                Ok(Some(AppMessage::AudioLevel(db))) => level = Some(db),
                 Ok(Some(AppMessage::AudioError(e))) => panic!("playback failed: {e}"),
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => break,
@@ -387,5 +432,6 @@ mod tests {
         }
         assert!(ready, "mpv never came up");
         assert!(position.is_some(), "mpv never reported a playback position");
+        assert!(level.is_some(), "mpv never reported how loud the audio is");
     }
 }

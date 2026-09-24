@@ -26,7 +26,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             .last()
             .map(|c| !c.title.is_empty())
             .unwrap_or(false);
-    let status_height: u16 = if has_chapter { 4 } else { 3 };
+    let text_height: u16 = if has_chapter { 4 } else { 3 };
+    let status_height = if tall_now_playing(app, area) {
+        NOW_PLAYING_HEIGHT + 2
+    } else {
+        text_height
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -44,7 +49,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         View::Search => render_content(frame, app, chunks[1]),
         View::Library => render_library(frame, app, chunks[1]),
     }
-    render_status_bar(frame, app, chunks[2]);
+    render_status_bar(frame, app, chunks[2], has_chapter);
     if queue_height > 0 {
         render_queue(frame, app, chunks[3]);
     }
@@ -384,7 +389,7 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) {
         Line::from(Span::styled("[p]     Saved playlists",        Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("[A]     Save queue as playlist", Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("[r]     Toggle loop",            Style::default().fg(Color::DarkGray))),
-        Line::from(Span::styled("[d]     Toggle thumbnails",      Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("[d]     Toggle visuals",         Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled("[?]     Help — all keys",       Style::default().fg(Color::Cyan))),
         Line::from(Span::styled("[q]     Quit",                   Style::default().fg(Color::DarkGray))),
     ]);
@@ -534,8 +539,98 @@ fn render_buffering_bar(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_status_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default().borders(Borders::ALL);
+/// Rows inside the border of the tall now-playing bar: the artwork's height,
+/// and the text plus spectrum beside it.
+const NOW_PLAYING_HEIGHT: u16 = 4;
+
+/// Whether the now-playing bar grows to hold the artwork and spectrum. Both
+/// are visuals, so `d` hides them; below these sizes the bar would squeeze
+/// the results list down to nothing.
+fn tall_now_playing(app: &App, area: Rect) -> bool {
+    app.show_visuals && area.height >= 20 && area.width >= 60 && app.now_playing.is_some()
+}
+
+fn render_status_bar(frame: &mut Frame, app: &mut App, area: Rect, has_chapter: bool) {
+    if !tall_now_playing(app, frame.area()) {
+        render_status_text(frame, app, area, Block::default().borders(Borders::ALL));
+        return;
+    }
+
+    let color = if app.is_buffering() { Color::Yellow } else { Color::Green };
+    let border = Block::default().borders(Borders::ALL).style(Style::default().fg(color));
+    let mut inner = border.inner(area);
+    frame.render_widget(border, area);
+
+    let playing_id = app.now_playing.as_ref().map(|t| t.id.as_str());
+    if let Some((_, protocol)) = app
+        .now_playing_thumb
+        .as_mut()
+        .filter(|(id, _)| Some(id.as_str()) == playing_id)
+    {
+        // hqdefault cropped to 16:9, on cells roughly twice as tall as wide.
+        let art_width = NOW_PLAYING_HEIGHT * 32 / 9;
+        let [art, rest] = Layout::horizontal([Constraint::Length(art_width + 1), Constraint::Min(0)])
+            .areas(inner);
+        let art = Rect { width: art_width, height: NOW_PLAYING_HEIGHT.min(art.height), ..art };
+        let img = StatefulImage::<StatefulProtocol>::new().resize(Resize::Fit(None));
+        frame.render_stateful_widget(img, art, protocol);
+        inner = rest;
+    }
+
+    let text_rows = if has_chapter { 2 } else { 1 };
+    let [text, bars] = Layout::vertical([Constraint::Length(text_rows), Constraint::Min(0)]).areas(inner);
+    render_status_text(frame, app, text, Block::default());
+    render_spectrum(frame, app, bars);
+}
+
+/// Eighth-block glyphs, from empty to a full cell.
+const BAR_GLYPHS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+
+/// The simulated spectrum: two-column bars with a one-column gap, lows on
+/// the left, green at the base running to red at the top.
+fn render_spectrum(frame: &mut Frame, app: &App, area: Rect) {
+    // Indented one column, level with the text above.
+    let area = Rect { x: area.x + 1, width: area.width.saturating_sub(1), ..area };
+    if area.height == 0 || area.width < 2 {
+        return;
+    }
+    let t = app.current_position();
+    // Whole bars only: a trailing gap doesn't need to fit, a half bar looks cut.
+    let count = (area.width as usize + 1) / 3;
+    let heights: Vec<usize> = (0..count)
+        .map(|i| {
+            let x = i as f64 / (count.max(2) - 1) as f64;
+            (app.spectrum.level(x, t) * (area.height as usize * 8) as f32).round() as usize
+        })
+        .collect();
+
+    let lines: Vec<Line> = (0..area.height as usize)
+        .map(|row| {
+            // Rows counted from the bottom, so the colour follows height.
+            let from_bottom = area.height as usize - 1 - row;
+            let frac = (from_bottom + 1) as f32 / area.height as f32;
+            let color = if frac <= 0.5 {
+                Color::Green
+            } else if frac <= 0.8 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+            let spans: Vec<Span> = heights
+                .iter()
+                .flat_map(|&h| {
+                    let fill = h.saturating_sub(from_bottom * 8).min(8);
+                    let glyph = BAR_GLYPHS[fill];
+                    [Span::styled(format!("{glyph}{glyph}"), Style::default().fg(color)), Span::raw(" ")]
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_status_text(frame: &mut Frame, app: &App, area: Rect, block: Block) {
 
     if let Some(ref track) = app.now_playing {
         if app.is_buffering() {
@@ -1062,7 +1157,7 @@ fn help_lines() -> Vec<Line<'static>> {
     lines.push(Line::from(""));
 
     lines.push(help_head("THE REST"));
-    lines.push(help_key("d", "Show / hide thumbnails"));
+    lines.push(help_key("d", "Show / hide thumbnails and the spectrum bars"));
     lines.push(help_key("?  or  F1", "This help"));
     lines.push(help_key("q", "Quit"));
     lines.push(help_key("click", "Click the progress bar to jump to that point"));
@@ -1271,6 +1366,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The artwork sits to the left of the track title, and the title is
+    /// still readable next to it.
+    #[test]
+    fn the_now_playing_bar_shows_the_tracks_artwork() {
+        let mut app = app();
+        app.has_image_support = true;
+        app.now_playing = Some(video("v1", "playing now"));
+        let protocol = app.picker.new_resize_protocol(image::DynamicImage::new_rgb8(16, 9));
+        app.now_playing_thumb = Some(("v1".to_string(), protocol));
+
+        let rows = draw_rows(&mut app, 100, 30);
+        let title_row = rows.iter().find(|r| r.contains("playing now")).unwrap();
+        let title_col = title_row.find("playing now").unwrap();
+        assert!(title_col > (NOW_PLAYING_HEIGHT * 32 / 9) as usize, "{title_row}");
+
+        // Artwork for a track that is no longer playing is not shown.
+        app.now_playing = Some(video("v2", "next one"));
+        let rows = draw_rows(&mut app, 100, 30);
+        let title_row = rows.iter().find(|r| r.contains("next one")).unwrap();
+        assert!(title_row.find("next one").unwrap() < title_col, "{title_row}");
+
+        for (w, h) in [(120, 40), (80, 24), (60, 20), (40, 12), (20, 6)] {
+            app.now_playing = Some(video("v1", "playing now"));
+            draw(&mut app, w, h);
+        }
+    }
+
+    /// Bars show while a track plays, and `d` takes them away along with
+    /// the artwork.
+    #[test]
+    fn the_spectrum_shows_while_playing_and_hides_with_the_visuals() {
+        let mut app = app();
+        app.now_playing = Some(video("v1", "playing now"));
+        app.play_start = Some(std::time::Instant::now() - std::time::Duration::from_secs(30));
+        app.audio_idle = false;
+        // Let the bars rise to full height.
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            app.animate();
+        }
+        let has_bars = |s: &str| BAR_GLYPHS[1..].iter().any(|g| s.contains(g));
+        assert!(has_bars(&draw(&mut app, 100, 30)));
+
+        app.show_visuals = false;
+        assert!(!has_bars(&draw(&mut app, 100, 30)));
     }
 
     /// Every view and dialog has to survive a render at whatever size the

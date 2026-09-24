@@ -165,7 +165,7 @@ press `A` to save the whole queue under a name of your choosing.
 | `-` | Volume down 5% |
 | `r` | Loop the current track on / off |
 | `z` | Shuffle on / off |
-| `d` | Toggle thumbnail visibility |
+| `d` | Toggle thumbnails and the spectrum bars |
 
 Shuffle reorders whatever is already queued and drops anything queued after
 that at a random spot, so a playlist comes out in a different order every time.
