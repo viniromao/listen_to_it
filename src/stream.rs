@@ -99,6 +99,18 @@ pub fn invalidate(watch_url: &str) {
     }
 }
 
+async fn run_ytdlp(watch_url: &str, player_client: Option<&str>) -> Result<std::process::Output> {
+    let mut cmd = tokio::process::Command::new(crate::ytdlp::path());
+    cmd.args(["-j", "-f", FORMAT, "--no-playlist", "--no-warnings"]);
+    if let Some(client) = player_client {
+        cmd.args(["--extractor-args", &format!("youtube:player_client={client}")]);
+    }
+    cmd.arg(watch_url)
+        .output()
+        .await
+        .context("failed to run yt-dlp")
+}
+
 /// Resolve `watch_url`, using (and filling) the cache.
 pub async fn resolve(watch_url: &str) -> Result<Arc<Stream>> {
     if let Some(hit) = cached(watch_url) {
@@ -113,18 +125,18 @@ pub async fn resolve(watch_url: &str) -> Result<Arc<Stream>> {
     }
 
     let started = std::time::Instant::now();
-    let output = tokio::process::Command::new(crate::ytdlp::path())
-        .args([
-            "-j",
-            "-f",
-            FORMAT,
-            "--no-playlist",
-            "--no-warnings",
-            watch_url,
-        ])
-        .output()
-        .await
-        .context("failed to run yt-dlp")?;
+    // The default clients currently hand out URLs that googlevideo answers
+    // with HTTP 403 (mpv: "Failed to open"). `web_embedded` still gets
+    // playable ones, but it can't resolve every video, so the default
+    // clients remain the fallback.
+    let mut output = run_ytdlp(watch_url, Some("web_embedded")).await?;
+    if !output.status.success() {
+        crate::logline!(
+            "stream: web_embedded failed for {watch_url} ({}), trying default clients",
+            first_error_line(&output.stderr)
+        );
+        output = run_ytdlp(watch_url, None).await?;
+    }
 
     if !output.status.success() {
         anyhow::bail!("{}", first_error_line(&output.stderr));
