@@ -101,6 +101,7 @@ pub fn invalidate(watch_url: &str) {
 
 async fn run_ytdlp(watch_url: &str, player_client: Option<&str>) -> Result<std::process::Output> {
     let mut cmd = tokio::process::Command::new(crate::ytdlp::path());
+    cmd.args(crate::ytdlp::auth_args());
     cmd.args(["-j", "-f", FORMAT, "--no-playlist", "--no-warnings"]);
     if let Some(client) = player_client {
         cmd.args(["--extractor-args", &format!("youtube:player_client={client}")]);
@@ -129,17 +130,31 @@ pub async fn resolve(watch_url: &str) -> Result<Arc<Stream>> {
     // with HTTP 403 (mpv: "Failed to open"). `web_embedded` still gets
     // playable ones, but it can't resolve every video, so the default
     // clients remain the fallback.
+    //
+    // "Sign in to confirm you're not a bot" is per-client, so `tv` is tried
+    // before giving up. If every client is blocked the network itself is
+    // flagged; see `ytdlp::auth_args` for the cookie workaround.
     let mut output = run_ytdlp(watch_url, Some("web_embedded")).await?;
-    if !output.status.success() {
+    for client in [Some("tv"), None] {
+        if output.status.success() {
+            break;
+        }
         crate::logline!(
-            "stream: web_embedded failed for {watch_url} ({}), trying default clients",
-            first_error_line(&output.stderr)
+            "stream: client failed for {watch_url} ({}), trying {}",
+            first_error_line(&output.stderr),
+            client.unwrap_or("default clients")
         );
-        output = run_ytdlp(watch_url, None).await?;
+        output = run_ytdlp(watch_url, client).await?;
     }
 
     if !output.status.success() {
-        anyhow::bail!("{}", first_error_line(&output.stderr));
+        let err = first_error_line(&output.stderr);
+        if err.contains("not a bot") && crate::ytdlp::auth_args().is_empty() {
+            anyhow::bail!(
+                "{err} — relaunch with LISTEN_TO_IT_COOKIES_FROM_BROWSER=safari (or chrome/firefox)"
+            );
+        }
+        anyhow::bail!("{err}");
     }
 
     let json: serde_json::Value =

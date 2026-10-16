@@ -57,6 +57,29 @@ const MAX_SYSTEM_YTDLP_AGE_DAYS: i64 = 14;
 
 static BIN: OnceLock<PathBuf> = OnceLock::new();
 
+/// Authentication arguments for every yt-dlp invocation.
+///
+/// YouTube answers some networks (VPNs, datacenter and shared IPs, sometimes
+/// plain residential ones) with "Sign in to confirm you're not a bot". The fix
+/// is to present a logged-in session, which yt-dlp can borrow from a browser.
+///
+/// - `LISTEN_TO_IT_COOKIES_FROM_BROWSER=safari` (or `chrome`, `firefox`,
+///   `brave`, `edge`, ... — anything `--cookies-from-browser` accepts)
+/// - `LISTEN_TO_IT_COOKIES=/path/to/cookies.txt` for a Netscape cookie file
+pub fn auth_args() -> Vec<String> {
+    if let Ok(file) = std::env::var("LISTEN_TO_IT_COOKIES") {
+        if !file.trim().is_empty() {
+            return vec!["--cookies".into(), file];
+        }
+    }
+    if let Ok(browser) = std::env::var("LISTEN_TO_IT_COOKIES_FROM_BROWSER") {
+        if !browser.trim().is_empty() {
+            return vec!["--cookies-from-browser".into(), browser];
+        }
+    }
+    Vec::new()
+}
+
 pub fn path() -> &'static Path {
     BIN.get()
         .expect("ytdlp::ensure() must be called before ytdlp::path()")

@@ -199,6 +199,7 @@ queue panel always shows what is really coming next.
 - Test manually: `mpv --no-video "https://www.youtube.com/watch?v=dQw4w9WgXcQ"`
 
 **Search returns no results**
+- **"Sign in to confirm you're not a bot"** — YouTube is flagging your network. Let yt-dlp borrow your browser's logged-in session: `LISTEN_TO_IT_COOKIES_FROM_BROWSER=safari listen_to_it` (also `chrome`, `firefox`, `brave`, ...), or point `LISTEN_TO_IT_COOKIES` at a Netscape `cookies.txt`. On macOS, Safari needs Full Disk Access for your terminal; Chrome will ask for Keychain access.
 - Delete the cached binary to force a fresh download: `rm ~/.cache/listen_to_it/yt-dlp`
 - YouTube occasionally changes their API; the next launch will download the latest yt-dlp automatically
 

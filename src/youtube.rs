@@ -70,6 +70,7 @@ pub async fn search(query: &str, max_results: usize) -> Result<Vec<VideoResult>>
         percent_encode(query)
     );
     let output = tokio::process::Command::new(crate::ytdlp::path())
+        .args(crate::ytdlp::auth_args())
         .args([
             "-J",
             "--flat-playlist",
@@ -143,6 +144,7 @@ pub async fn fetch_playlist_streamed(
     tx: UnboundedSender<AppMessage>,
 ) -> Result<()> {
     let mut child = tokio::process::Command::new(crate::ytdlp::path())
+        .args(crate::ytdlp::auth_args())
         .args(["-j", "--flat-playlist", "--lazy-playlist", "--no-warnings", url])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -297,6 +299,7 @@ pub async fn fetch_playlist_meta(url: &str) -> Result<PlaylistMeta> {
     // process per row and crowd out the track the user is waiting on.
     let _permit = crate::ytdlp::background_permit().await;
     let output = tokio::process::Command::new(crate::ytdlp::path())
+        .args(crate::ytdlp::auth_args())
         .args([
             "-J",
             "--flat-playlist",
