@@ -67,6 +67,31 @@ static BIN: OnceLock<PathBuf> = OnceLock::new();
 ///   `brave`, `edge`, ... — anything `--cookies-from-browser` accepts)
 /// - `LISTEN_TO_IT_COOKIES=/path/to/cookies.txt` for a Netscape cookie file
 pub fn auth_args() -> Vec<String> {
+    if let Some(browser) = DETECTED_BROWSER.lock().ok().and_then(|g| g.clone()) {
+        return vec!["--cookies-from-browser".into(), browser];
+    }
+    configured_auth_args()
+}
+
+/// A browser whose cookies got past the bot check, found automatically after
+/// an explicit configuration was absent or failed.
+static DETECTED_BROWSER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn remember_browser(browser: &str) {
+    if let Ok(mut g) = DETECTED_BROWSER.lock() {
+        *g = Some(browser.to_string());
+    }
+}
+
+/// Browsers to try, in order, when YouTube demands a sign-in.
+pub const AUTO_BROWSERS: &[&str] = &["chrome", "safari", "firefox", "brave", "edge"];
+
+/// True when auth was explicitly configured by the user.
+pub fn is_configured() -> bool {
+    !configured_auth_args().is_empty()
+}
+
+fn configured_auth_args() -> Vec<String> {
     if let Ok(file) = std::env::var("LISTEN_TO_IT_COOKIES") {
         if !file.trim().is_empty() {
             return vec!["--cookies".into(), file];

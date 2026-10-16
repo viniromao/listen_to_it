@@ -100,8 +100,16 @@ pub fn invalidate(watch_url: &str) {
 }
 
 async fn run_ytdlp(watch_url: &str, player_client: Option<&str>) -> Result<std::process::Output> {
+    run_ytdlp_with(watch_url, player_client, crate::ytdlp::auth_args()).await
+}
+
+async fn run_ytdlp_with(
+    watch_url: &str,
+    player_client: Option<&str>,
+    auth: Vec<String>,
+) -> Result<std::process::Output> {
     let mut cmd = tokio::process::Command::new(crate::ytdlp::path());
-    cmd.args(crate::ytdlp::auth_args());
+    cmd.args(auth);
     cmd.args(["-j", "-f", FORMAT, "--no-playlist", "--no-warnings"]);
     if let Some(client) = player_client {
         cmd.args(["--extractor-args", &format!("youtube:player_client={client}")]);
@@ -147,11 +155,34 @@ pub async fn resolve(watch_url: &str) -> Result<Arc<Stream>> {
         output = run_ytdlp(watch_url, client).await?;
     }
 
+    // Still blocked: borrow a logged-in session from whichever installed
+    // browser has one, and remember it for the rest of the run.
+    if !output.status.success()
+        && first_error_line(&output.stderr).contains("not a bot")
+        && !crate::ytdlp::is_configured()
+    {
+        for browser in crate::ytdlp::AUTO_BROWSERS {
+            crate::logline!("stream: bot check, trying cookies from {browser}");
+            let args = vec!["--cookies-from-browser".to_string(), browser.to_string()];
+            let attempt = run_ytdlp_with(watch_url, Some("web_embedded"), args.clone()).await?;
+            let attempt = if attempt.status.success() {
+                attempt
+            } else {
+                run_ytdlp_with(watch_url, None, args).await?
+            };
+            if attempt.status.success() {
+                crate::ytdlp::remember_browser(browser);
+                output = attempt;
+                break;
+            }
+        }
+    }
+
     if !output.status.success() {
         let err = first_error_line(&output.stderr);
-        if err.contains("not a bot") && crate::ytdlp::auth_args().is_empty() {
+        if err.contains("not a bot") {
             anyhow::bail!(
-                "{err} — relaunch with LISTEN_TO_IT_COOKIES_FROM_BROWSER=safari (or chrome/firefox)"
+                "{err} — log in to YouTube in Chrome/Safari/Firefox, or set LISTEN_TO_IT_COOKIES_FROM_BROWSER"
             );
         }
         anyhow::bail!("{err}");
