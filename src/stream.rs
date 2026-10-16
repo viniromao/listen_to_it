@@ -143,7 +143,7 @@ pub async fn resolve(watch_url: &str) -> Result<Arc<Stream>> {
     // before giving up. If every client is blocked the network itself is
     // flagged; see `ytdlp::auth_args` for the cookie workaround.
     let mut output = run_ytdlp(watch_url, Some("web_embedded")).await?;
-    for client in [Some("tv"), None] {
+    for client in [Some("android_vr"), Some("tv"), Some("mweb"), Some("web_safari"), None] {
         if output.status.success() {
             break;
         }
